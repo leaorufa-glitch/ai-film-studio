@@ -128,6 +128,21 @@ def mark_impact(core: Core, project_id: str, source_kind: str, source_id: str,
     core.db.commit()
 
 
+def generation_provider(job: dict) -> str:
+    providers = {provider for provider in (
+        job['metadata'].get('provider'),
+        (job['snapshot'].get('cost_estimate') or {}).get('provider')) if provider}
+    profile_provider = {'h3-darl': 'darl', 'h3-runninghub': 'runninghub'}.get(
+        job['snapshot']['task'].get('model_profile', {}).get('id'))
+    if profile_provider:
+        providers.add(profile_provider)
+    if len(providers) > 1 or providers - {'darl', 'runninghub'}:
+        raise DomainError('original Job Provider is inconsistent or unsupported')
+    if not providers:
+        raise DomainError('original Job Provider unavailable; use Creative Regenerate')
+    return next(iter(providers))
+
+
 def provider_status() -> dict:
     key = os.getenv('DARL_API_KEY')
     video = '服务未启动' if os.getenv('H3_SERVER_ON') != '1' else ('可用' if key else '未配置')
@@ -1165,22 +1180,32 @@ def create_app(db_path: str | Path | None = None, media_root: str | Path | None 
     @app.post('/api/projects/{pid}/clips/{cid}/generate')
     def generate(pid: str, cid: str, retry_of: str | None = None,
                  creative_reason: str | None = None, request_id: str | None = None,
-                 provider: str = 'darl'):
-        if provider not in {'darl','runninghub'}:
+                 provider: str | None = None):
+        if provider is not None and provider not in {'darl','runninghub'}:
             raise HTTPException(400, 'unknown H3 provider')
-        state = provider_state()
-        status = state['h3' if provider == 'darl' else 'runninghub_h3']
-        if status != '可用':
-            raise HTTPException(503, {'code': 'PROVIDER_UNAVAILABLE',
-                                      'message': state['h3_message'] if provider == 'darl'
-                                      else '备用 RunningHub H3 未配置或已停用。'})
-        if retry_of and creative_reason:
+        if retry_of and creative_reason is not None:
             raise HTTPException(400, 'technical retry and creative regenerate are separate actions')
         if request_id and (len(request_id)>100 or not request_id.replace('-','').isalnum()):
             raise HTTPException(400, 'invalid request id')
         def op(c):
             belong(c, 'clip', cid, pid)
-            if provider == 'runninghub' and c.get('clip',cid)['payload']['handoff']=='VIDEO_CONTINUATION':
+            selected_provider = provider or 'darl'
+            original = None
+            if retry_of:
+                original = c.job(retry_of)
+                if original['snapshot']['task']['clip_id'] != cid:
+                    raise DomainError('技术重试必须指向此 Clip 的失败 Job。')
+                selected_provider = generation_provider(original)
+                if provider is not None and provider != selected_provider:
+                    raise DomainError('技术重试必须沿用原 Provider；切换通道请明确进行创作重生成。')
+            state = provider_state()
+            status = state['h3' if selected_provider == 'darl' else 'runninghub_h3']
+            if status != '可用':
+                raise HTTPException(503, {'code': 'PROVIDER_UNAVAILABLE',
+                                          'message': state['h3_message'] if selected_provider == 'darl'
+                                          else '备用 RunningHub H3 未配置或已停用。'})
+            handoff = original['snapshot']['task']['task_mode'] if original else c.get('clip',cid)['payload']['handoff']
+            if selected_provider == 'runninghub' and handoff == 'VIDEO_CONTINUATION':
                 raise DomainError('RunningHub 的参考视频尚未通过同一长镜头续接验证；此 Clip 不能使用备用通道。')
             if request_id:
                 existing=c.db.execute('SELECT * FROM generation_requests WHERE request_id=?',(request_id,)).fetchone()
@@ -1199,9 +1224,6 @@ def create_app(db_path: str | Path | None = None, media_root: str | Path | None 
             if retry_of:
                 if not previous or previous[0]['id']!=retry_of or previous[0]['status']!='failed':
                     raise DomainError('技术重试必须指向此 Clip 最新的失败 Job。')
-                original_provider=previous[0]['metadata'].get('provider') or (previous[0]['snapshot'].get('cost_estimate') or {}).get('provider','darl')
-                if provider != original_provider:
-                    raise DomainError('技术重试必须沿用原 Provider；切换通道请明确进行创作重生成。')
                 chain=0;parent=previous[0]
                 while parent['snapshot'].get('retry_of'):
                     chain+=1;parent=c.job(parent['snapshot']['retry_of'])
@@ -1224,32 +1246,36 @@ def create_app(db_path: str | Path | None = None, media_root: str | Path | None 
                 raise HTTPException(409,'此 Clip 已有提交中的任务；请刷新状态。') from exc
             created=False
             try:
-                profile_id='h3-darl' if provider == 'darl' else 'h3-runninghub'
-                if not any(p['id']==profile_id for p in latest(c,'model_profile')):
-                    profile=darl_h3_profile(False) if provider == 'darl' else runninghub_h3_profile()
-                    c.put('model_profile',profile_id,profile,'documented-profile','documented')
-                task_id=uid('task');continuation=None
-                if c.get('clip',cid)['payload']['handoff']=='VIDEO_CONTINUATION':
-                    dep=c.db.execute("SELECT upstream_clip_id FROM dependencies WHERE clip_id=? AND kind='VIDEO_CONTINUATION'",(cid,)).fetchone()
-                    if not dep: raise DomainError('continuation dependency missing')
-                    selected=c.selection(dep['upstream_clip_id'])
-                    control=c.db.execute("SELECT id FROM objects WHERE kind='control_media' AND json_extract(payload,'$.role')='stable_tail' AND json_extract(payload,'$.source_take_id')=? ORDER BY created_at DESC LIMIT 1",
-                                         (selected['take_id'] if selected else '',)).fetchone()
-                    if not control: raise DomainError('selected upstream Stable Tail missing')
-                    continuation=c.continuation_source(dep['upstream_clip_id'],control['id'])
-                task=c.compile_h3(task_id,'brief:'+cid,profile_id,
-                                  parameters={'resolution':'480P','num_inference_steps':20,'turbo':False,'watermark':False},
-                                  continuation=continuation)
-                preflight=c.preflight(task_id)
+                if original:
+                    task_id=original['task_id']
+                    task=c.task(task_id)
+                else:
+                    profile_id='h3-darl' if selected_provider == 'darl' else 'h3-runninghub'
+                    if not any(p['id']==profile_id for p in latest(c,'model_profile')):
+                        profile=darl_h3_profile(False) if selected_provider == 'darl' else runninghub_h3_profile()
+                        c.put('model_profile',profile_id,profile,'documented-profile','documented')
+                    task_id=uid('task');continuation=None
+                    if handoff=='VIDEO_CONTINUATION':
+                        dep=c.db.execute("SELECT upstream_clip_id FROM dependencies WHERE clip_id=? AND kind='VIDEO_CONTINUATION'",(cid,)).fetchone()
+                        if not dep: raise DomainError('continuation dependency missing')
+                        selected=c.selection(dep['upstream_clip_id'])
+                        control=c.db.execute("SELECT id FROM objects WHERE kind='control_media' AND json_extract(payload,'$.role')='stable_tail' AND json_extract(payload,'$.source_take_id')=? ORDER BY created_at DESC LIMIT 1",
+                                             (selected['take_id'] if selected else '',)).fetchone()
+                        if not control: raise DomainError('selected upstream Stable Tail missing')
+                        continuation=c.continuation_source(dep['upstream_clip_id'],control['id'])
+                    task=c.compile_h3(task_id,'brief:'+cid,profile_id,
+                                      parameters={'resolution':'480P','num_inference_steps':20,'turbo':False,'watermark':False},
+                                      continuation=continuation)
+                preflight=c.preflight(task_id,retry_of=retry_of)
                 if not preflight.ready: raise DomainError('model preflight not ready: '+json.dumps(preflight.reasons))
-                adapter=DarlH3Adapter() if provider == 'darl' else RunningHubH3Adapter()
+                adapter=DarlH3Adapter() if selected_provider == 'darl' else RunningHubH3Adapter()
                 adapter.build_request(task)
-                if not c.preflight(task_id).ready:
+                if not c.preflight(task_id,retry_of=retry_of).ready:
                     raise DomainError('compiled task became stale before submission')
                 attempt='technical_retry' if retry_of else 'creative_regenerate' if creative_reason else 'initial'
                 c.create_job(job_id,task_id,retry_of=retry_of,
                              cost_estimate={'candidate_limit':1,'resolution':'480P','attempt_kind':attempt,
-                                            'creative_reason':(creative_reason or '')[:500], 'provider':provider})
+                                            'creative_reason':(creative_reason or '')[:500], 'provider':selected_provider})
                 created=True
                 if request_id:
                     c.db.execute('UPDATE generation_requests SET job_id=? WHERE request_id=?',(job_id,request_id));c.db.commit()
@@ -1257,16 +1283,16 @@ def create_app(db_path: str | Path | None = None, media_root: str | Path | None 
                     submit_started=time.monotonic()
                     response=adapter.submit(task,job_id)
                 except ProviderError as exc:
-                    c.job_event(job_id,'failed',{'provider':provider,'provider_error':exc.as_dict(),'error_category':exc.code})
+                    c.job_event(job_id,'failed',{'provider':selected_provider,'provider_error':exc.as_dict(),'error_category':exc.code})
                     c.db.execute('DELETE FROM active_generation WHERE clip_id=? AND job_id=?',(cid,job_id));c.db.commit()
                     raise HTTPException(503,{'code':'PROVIDER_UNAVAILABLE' if exc.code=='fail_to_fetch_task' and exc.http_status==404 else exc.code,
                                              'message':'H3 视频服务器当前未启动。' if exc.code=='fail_to_fetch_task' and exc.http_status==404 else '视频服务提交失败。',
                                              'job_id':job_id}) from exc
-                c.job_event(job_id,'running',{'provider':provider,'provider_task_id':response['id'],
+                c.job_event(job_id,'running',{'provider':selected_provider,'provider_task_id':response['id'],
                                               'provider_status':response['status']})
                 next_poll=(utcnow()+__import__('datetime').timedelta(seconds=180)).isoformat()
                 c.db.execute('INSERT INTO job_runtime(job_id,provider,provider_task_id,next_poll_at,submitted_at,submit_latency_ms) VALUES (?,?,?,?,?,?)',
-                             (job_id,provider,response['id'],next_poll,utcnow().isoformat(),round((time.monotonic()-submit_started)*1000)))
+                             (job_id,selected_provider,response['id'],next_poll,utcnow().isoformat(),round((time.monotonic()-submit_started)*1000)))
                 c.db.commit()
                 return {'job':c.job(job_id),'expected_minutes':3}
             except Exception:
@@ -1593,9 +1619,9 @@ def create_app(db_path: str | Path | None = None, media_root: str | Path | None 
             job=c.job(jid)
             if job['status']!='failed':raise DomainError('only failed jobs may be retried')
             cid=job['snapshot']['task']['clip_id']
-            return JobWorker._project_for_clip(c,cid),cid
-        pid,cid=execute(find)
-        return generate(pid,cid,retry_of=jid,request_id=body.request_id)
+            return JobWorker._project_for_clip(c,cid),cid,generation_provider(job)
+        pid,cid,provider=execute(find)
+        return generate(pid,cid,retry_of=jid,request_id=body.request_id,provider=provider)
 
     @app.get('/api/admin/media')
     def admin_media():
