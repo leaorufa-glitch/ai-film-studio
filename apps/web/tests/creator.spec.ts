@@ -91,6 +91,7 @@ test('TEST ONLY Take needs human selection and actual-state confirmation before 
   await expect(page.getByText('TEST ONLY')).toBeVisible();
   await page.getByRole('button', {name:'采用这条'}).click();
   await expect(page.getByText('已采用此 Take')).toBeVisible();
+  await expect(page.getByRole('combobox', {name:'希望 AI 帮什么'})).toHaveValue('review_observation');
   await expect(page.locator('.state-diff')).toContainText('林夏');
   await expect(page.locator('.state-diff')).not.toContainText('未在最终制作方案中填写');
   await page.getByRole('textbox', {name:'这条片段实际怎样结束？'}).fill('左手拿信，望向站台。');
@@ -115,4 +116,44 @@ test('structured scene origin and 1024px workspace labels remain clear', async (
   await expect(page.getByRole('link', {name:'03 场次与分镜'})).toBeVisible();
   await expect(page.getByRole('link', {name:'04 影片制作'})).toBeVisible();
   await expect(page.locator('.sidebar-project-title')).toContainText('雨夜车站');
+});
+
+test('TEST ONLY contextual proposal requires human acceptance in 01 and 03', async ({page}) => {
+  await page.goto('/projects/station-film/01');
+  await expect(page.getByText('TEST ONLY 场次提案：林夏望向列车灯。')).toBeVisible();
+  await expect(page.locator('.scene-row')).toHaveCount(1);
+  await page.locator('.proposal-box').getByRole('button', {name:'接受并写入'}).click();
+  await expect(page.locator('.scene-row')).toHaveCount(2);
+  await page.goto('/projects/station-film/03');
+  await expect(page.getByText('TEST ONLY 观察决心')).toBeVisible();
+  await expect(page.locator('.shot-card')).toHaveCount(5);
+  await page.locator('.proposal-box').first().getByRole('button', {name:'接受并写入'}).click();
+  await expect(page.locator('.shot-card')).toHaveCount(6);
+  await expect(page.locator('.shot-card').last()).toContainText('待确认');
+});
+
+test('TEST ONLY image candidate is adopted explicitly and Clip proposal stays human gated', async ({page}) => {
+  await page.goto('/projects/station-film/02');
+  await expect(page.getByText('TEST ONLY 人物候选')).toBeVisible();
+  await expect(page.locator('.asset-card')).toHaveCount(0);
+  await page.locator('.candidate-card').getByRole('button', {name:'采用'}).click();
+  await expect(page.locator('.candidate-card')).toContainText('已采用');
+  await expect(page.locator('.asset-card')).toHaveCount(1);
+  await page.goto('/projects/station-film/04');
+  await expect(page.locator('.proposal-box').first()).toContainText('TEST ONLY Clip 提案');
+  await expect(page.locator('.clip-panel')).toHaveCount(4);
+  await page.locator('.proposal-box').first().getByRole('button', {name:'接受并写入'}).click();
+  await expect(page.locator('.clip-panel')).toHaveCount(5);
+  await expect(page.getByText('H3 视频服务器当前未启动。')).toBeVisible();
+});
+
+test('independent Admin shows provider, failed job and media without a key', async ({page}) => {
+  await page.goto('/admin');
+  await expect(page.getByRole('heading', {name:'运行管理台'})).toBeVisible();
+  await expect(page.getByText('TEST ONLY QA 数据库', {exact:false})).toBeVisible();
+  await expect(page.getByText('Darl H3')).toBeVisible();
+  await page.getByRole('combobox', {name:'任务状态筛选'}).selectOption('failed');
+  await expect(page.getByText('job-e2e-failed-test-only')).toBeVisible();
+  await expect(page.getByText('TEST ONLY', {exact:true}).first()).toBeVisible();
+  await expect(page.locator('body')).not.toContainText(/sk-[A-Za-z0-9]{20,}/);
 });

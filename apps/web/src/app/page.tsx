@@ -24,7 +24,7 @@ export default function Home() {
     } catch (e: any) { setError(e.message); setBusy(false); }
   }
   return <main className="home">
-    <header className="home-top"><div className="brand"><span className="brand-mark"><Clapperboard size={22}/></span><span>AI FILM <strong>STUDIO</strong></span></div><span className="home-top-note">创作者工作室 · 本地项目</span></header>
+    <header className="home-top"><div className="brand"><span className="brand-mark"><Clapperboard size={22}/></span><span>AI FILM <strong>STUDIO</strong></span></div><div className="home-top-note">创作者工作室 · 本地项目　<Link href="/admin">运行管理台</Link></div></header>
     <section className="hero"><div className="eyebrow"><span className="eyebrow-line"/> YOUR CREATIVE SPACE</div><h1>让故事，<em>成为电影。</em></h1><p>从一句想法到最终影片。把重要的创作决定留给你，其余生产工作清晰地放在每一步。</p><button className="primary hero-cta" onClick={() => setOpen(true)}><Plus size={18}/> 新建影片 <ArrowRight size={18}/></button><div className="hero-orbit orbit-one"/><div className="hero-orbit orbit-two"/><div className="hero-glow"/></section>
     <section className="project-section"><div className="section-heading"><div><div className="eyebrow">YOUR FILMS</div><h2>继续创作</h2></div><div className="search-box"><Search size={17}/><input aria-label="搜索项目" placeholder="搜索影片..." value={query} onChange={e => setQuery(e.target.value)}/></div></div>
       {error && <div className="alert error">{error}</div>}
