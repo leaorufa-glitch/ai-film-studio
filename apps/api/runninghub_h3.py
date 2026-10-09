@@ -5,11 +5,12 @@ import hashlib
 import json
 import mimetypes
 import os
+import re
 import subprocess
 import uuid
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 
 from film_core import DomainError
@@ -69,29 +70,107 @@ class RunningHubH3Adapter:
         self.base_url = base_url.rstrip("/")
         self.opener = opener
 
-    def _send(self, path, *, payload=None, content_type="application/json", bearer=False, raw=False, timeout=60):
+    def _sanitize(self, response):
+        secrets = {str(self.key)}
+
+        def sensitive(field):
+            name = re.sub(r"[^a-z0-9]", "", str(field).lower())
+            return (name.endswith("key") or name in {"auth", "sessionid", "webappid"} or
+                    any(part in name for part in ("authorization", "authentication", "credential", "secret", "password",
+                                                  "passwd", "token", "cookie", "signature")))
+
+        def collect(value, credential=False):
+            if isinstance(value, dict):
+                for field, item in value.items():
+                    collect(item, credential or sensitive(field))
+            elif isinstance(value, list):
+                for item in value:
+                    collect(item, credential)
+            elif credential and isinstance(value, str) and value:
+                secrets.add(value)
+                if value.lower().startswith(("bearer ", "basic ")):
+                    secrets.add(value.split(" ", 1)[1])
+            elif credential and isinstance(value, (int, float)) and not isinstance(value, bool):
+                secrets.add(str(value))
+
+        collect(response)
+        replacements = sorted({secret for value in secrets for secret in (value, quote(value, safe=""))},
+                              key=len, reverse=True)
+
+        def text(value):
+            for secret in replacements:
+                value = value.replace(secret, "[REDACTED]")
+            value = re.sub(r"(?i)\b(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]+", "[REDACTED]", value)
+            value = re.sub(r"(?i)\b(?:sk-[A-Za-z0-9_-]{8,}|[a-f0-9]{32,})\b", "[REDACTED]", value)
+            value = re.sub(r"(https?://)[^\s/:@]+:[^\s/@]+@", r"\1[REDACTED]@", value)
+            value = re.sub(r"(?i)\b(?:[A-Za-z0-9_-]*(?:api[_-]?key|token|secret|password|authorization|credential)[A-Za-z0-9_-]*)"
+                           r"\s*[=:]\s*(?:\"[^\"]*\"|'[^']*'|[^\s,;&}]+)", "[REDACTED]", value)
+            return value[:2048]
+
+        def redact(value, depth=0):
+            if depth > 10:
+                return "[TRUNCATED]"
+            if isinstance(value, dict):
+                return {text(str(field)): "[REDACTED]" if sensitive(field) else redact(item, depth + 1)
+                        for field, item in list(value.items())[:100]}
+            if isinstance(value, list):
+                return [redact(item, depth + 1) for item in value[:100]]
+            return text(value) if isinstance(value, str) else value
+
+        return redact(response)
+
+    def _create_diagnostics(self, response, http_status):
+        safe = self._sanitize(response)
+        message = next((safe.get(field) for field in ("msg", "message")
+                        if isinstance(safe.get(field), str) and safe[field].strip()), None)
+        return {"provider": self.provider, "operation": "create", "provider_code": safe.get("code"),
+                "provider_message": message, "http_status": http_status, "response_metadata": safe}
+
+    def _send(self, path, *, payload=None, content_type="application/json", bearer=False, raw=False, timeout=60,
+              operation=None):
         data = payload if isinstance(payload, bytes) else json.dumps(payload, ensure_ascii=False).encode("utf-8")
         headers = {"Content-Type": content_type}
         if bearer:
             headers["Authorization"] = "Bearer " + self.key
         request = Request(self.base_url + path, data=data, headers=headers, method="POST")
+        http_status = None
+        http_error = False
         try:
             with self.opener(request, timeout=timeout) as response:
+                http_status = getattr(response, "status", None)
+                if http_status is None and hasattr(response, "getcode"):
+                    http_status = response.getcode()
                 body = response.read()
-            if raw:
-                return body
+        except HTTPError as exc:
+            if operation != "create":
+                raise ProviderError("HTTP_%s" % exc.code, "RunningHub request failed",
+                                    transient=exc.code in (408, 429, 500, 502, 503, 504),
+                                    http_status=exc.code) from None
+            http_status = exc.code
+            http_error = True
+            body = exc.read()
+        except (URLError, TimeoutError):
+            detail = self._create_diagnostics({}, http_status) if operation == "create" else None
+            raise ProviderError("NETWORK_ERROR", "RunningHub connection failed", transient=True,
+                                http_status=http_status, detail=detail) from None
+        if raw:
+            return body
+        try:
             result = json.loads(body)
             if not isinstance(result, dict):
                 raise ValueError("non-object response")
-            return result
-        except HTTPError as exc:
-            raise ProviderError("HTTP_%s" % exc.code, "RunningHub request failed",
-                                transient=exc.code in (408, 429, 500, 502, 503, 504),
-                                http_status=exc.code) from None
-        except (URLError, TimeoutError):
-            raise ProviderError("NETWORK_ERROR", "RunningHub connection failed", transient=True) from None
         except (ValueError, UnicodeError):
-            raise ProviderError("INVALID_PROVIDER_RESPONSE", "RunningHub response could not be read") from None
+            detail = self._create_diagnostics({"response_format": "invalid_json_object"}, http_status) if operation == "create" else None
+            raise ProviderError("INVALID_PROVIDER_RESPONSE", "RunningHub response could not be read",
+                                http_status=http_status, detail=detail) from None
+        if operation == "create":
+            if http_error:
+                detail = self._create_diagnostics(result, http_status)
+                raise ProviderError("HTTP_%s" % http_status, detail["provider_message"] or "RunningHub request failed",
+                                    transient=http_status in (408, 429, 500, 502, 503, 504),
+                                    http_status=http_status, detail=detail)
+            return result, http_status
+        return result
 
     @staticmethod
     def _node(node_id, field, value):
@@ -175,13 +254,19 @@ class RunningHubH3Adapter:
         for slot, field, path in spec["uploads"]:
             value = self.upload(path)
             next(node for node in nodes if node["nodeId"] == slot and node["fieldName"] == field)["value"] = value
-        result = self._send("/task/openapi/ai-app/run",
-                            payload={"apiKey": self.key, "webappId": int(self.webapp_id),
-                                     "nodeInfoList": nodes})
-        data = result.get("data") or {}
-        task_id = data.get("taskId")
-        if result.get("code") != 0 or not isinstance(task_id, (str, int)) or not str(task_id).isdigit():
-            raise ProviderError("INVALID_CREATE_RESPONSE", "RunningHub did not return a task ID")
+        result, http_status = self._send("/task/openapi/ai-app/run",
+                                       payload={"apiKey": self.key, "webappId": int(self.webapp_id),
+                                                "nodeInfoList": nodes}, operation="create")
+        if result.get("code") != 0:
+            detail = self._create_diagnostics(result, http_status)
+            raise ProviderError("RUNNINGHUB_CREATE_FAILED", detail["provider_message"] or "RunningHub rejected create request",
+                                http_status=http_status, detail=detail)
+        data = result.get("data")
+        task_id = data.get("taskId") if isinstance(data, dict) else None
+        if (isinstance(task_id, bool) or not isinstance(task_id, (str, int)) or
+                not re.fullmatch(r"[0-9]+", str(task_id)) or int(task_id) <= 0):
+            raise ProviderError("INVALID_CREATE_RESPONSE", "RunningHub did not return a valid task ID",
+                                http_status=http_status, detail=self._create_diagnostics(result, http_status))
         return {"id": str(task_id), "status": str(data.get("taskStatus", "QUEUED")).lower()}
 
     def poll(self, provider_task_id):
