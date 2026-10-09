@@ -43,7 +43,7 @@ test('project → script → scene → world → shot → clip → approved Brie
   await page.getByRole('button', {name:'保存修改'}).click();
   await page.getByRole('button', {name:'确认镜头'}).click();
   await page.getByRole('link', {name:'04 影片制作'}).click();
-  await expect(page.getByText('H3 视频服务器当前未启动。')).toBeVisible();
+  await expect(page.getByText('请在服务端配置 DARL_API_KEY。')).toBeVisible();
   await page.getByRole('textbox', {name:'目标时长（秒）'}).fill('5');
   await page.getByRole('button', {name:'创建 Clip'}).click();
   await page.locator('.clip-summary').first().click();
@@ -73,14 +73,14 @@ test('project → script → scene → world → shot → clip → approved Brie
 
 test('station plan shows the real Brief without invented storyboard or media', async ({page}) => {
   await page.goto('/projects/station-film/04');
-  await expect(page.getByText('H3 视频服务器当前未启动。')).toBeVisible();
+  await expect(page.getByText('请在服务端配置 DARL_API_KEY。')).toBeVisible();
   await page.getByRole('button', {name:/Clip A/}).click();
   await expect(page.getByRole('heading', {name:'最终制作方案'})).toBeVisible();
   await expect(page.getByText('镜头 1 0–3s', {exact:false})).toBeVisible();
   await expect(page.locator('.brief-readable')).not.toContainText('linxia');
   await expect(page.locator('.brief-readable')).not.toContainText('scene_initial');
   await expect(page.locator('.brief-readable')).not.toContainText('{');
-  await expect(page.locator('.clip-status-grid').first()).toContainText('模型服务未启动');
+  await expect(page.locator('.clip-status-grid').first()).toContainText('模型服务未配置');
   await page.getByRole('link', {name:'05 审片'}).click();
   await expect(page.getByText('测试结果或媒体不可播放')).toBeVisible();
   await expect(page.locator('video')).toHaveCount(0);
@@ -144,7 +144,7 @@ test('TEST ONLY image candidate is adopted explicitly and Clip proposal stays hu
   await expect(page.locator('.clip-panel')).toHaveCount(4);
   await page.locator('.proposal-box').first().getByRole('button', {name:'接受并写入'}).click();
   await expect(page.locator('.clip-panel')).toHaveCount(5);
-  await expect(page.getByText('H3 视频服务器当前未启动。')).toBeVisible();
+  await expect(page.getByText('请在服务端配置 DARL_API_KEY。')).toBeVisible();
 });
 
 test('independent Admin shows provider, failed job and media without a key', async ({page}) => {
@@ -158,37 +158,46 @@ test('independent Admin shows provider, failed job and media without a key', asy
   await expect(page.locator('body')).not.toContainText(/sk-[A-Za-z0-9]{20,}/);
 });
 
-test('local H3 offline offers RunningHub explicitly and keeps continuation blocked', async ({page}) => {
-  await page.route('**/api/providers', async route => {
-    const response = await route.fetch();
-    const data = await response.json();
-    await route.fulfill({response, json:{...data, runninghub_h3:'可用',
-      h3_message:'本地 H3 未启动，可使用备用 RunningHub H3；也可以继续完成制作计划。'}});
+for (const selfHosted of [true, false]) {
+  test(`Darl route is explicit with self-hosted availability ${selfHosted}`, async ({page}) => {
+    await page.route('**/api/providers', async route => {
+      const response = await route.fetch();
+      const data = await response.json();
+      await route.fulfill({response, json:{...data, h3:'可用', provider:'darl',
+        execution_model:selfHosted?'MiniMax-H3':'runninghub-minimax-h3',
+        execution_route:selfHosted?'自建 H3':'云端 H3 · 备用',
+        self_hosted_h3:selfHosted?'可用':'服务未启动', cloud_h3:'可用'}});
+    });
+    await page.route('**/api/projects/station-film/jobs', route => route.fulfill({json:[]}));
+    await page.route('**/api/projects/station-film/clips/A/generate?**', route => route.fulfill({
+      json:{job:{id:'TEST-ONLY-route-job'}, expected_minutes:3}
+    }));
+    await page.goto('/projects/station-film/04');
+    await page.getByRole('button', {name:/Clip A/}).click();
+    await expect(page.locator('.execution-route')).toContainText(selfHosted?'自建 H3':'云端 H3 · 备用');
+    await expect(page.getByRole('combobox', {name:'本次视频服务'})).toHaveCount(0);
+    const requestPromise = page.waitForRequest(request => request.method()==='POST' && request.url().includes('/clips/A/generate?'));
+    await page.getByRole('button', {name:'生成一条', exact:true}).click();
+    const request = await requestPromise;
+    expect(new URL(request.url()).searchParams.has('provider')).toBe(false);
+    expect(new URL(request.url()).searchParams.has('execution_model')).toBe(false);
   });
-  await page.goto('/projects/station-film/04');
-  await expect(page.getByText('本地 H3 未启动，可使用备用 RunningHub H3', {exact:false}).first()).toBeVisible();
-  await page.getByRole('button', {name:/Clip A/}).click();
-  const selector = page.getByRole('combobox', {name:'本次视频服务'});
-  await expect(selector).toHaveValue('darl');
-  await selector.selectOption('runninghub');
-  await expect(selector).toHaveValue('runninghub');
-  await page.getByRole('button', {name:/Clip C2/}).click();
-  const continuation = page.locator('.clip-panel').filter({has:page.getByRole('button', {name:/Clip C2/})});
-  await expect(continuation.getByRole('option', {name:/RunningHub H3/})).toHaveAttribute('disabled', '');
-  await expect(continuation).toContainText('参考视频不等于同一长镜头续接');
-});
+}
 
-test('TEST ONLY technical retry uses original provider and ignores latest Brief readiness', async ({page}) => {
+test('TEST ONLY technical retry keeps frozen cloud model despite current self-hosted route', async ({page}) => {
   await page.route('**/api/providers', async route => {
     const response = await route.fetch();
     const data = await response.json();
-    await route.fulfill({response, json:{...data, h3:'服务未启动', runninghub_h3:'可用'}});
+    await route.fulfill({response, json:{...data, h3:'可用', execution_model:'MiniMax-H3',
+      execution_route:'自建 H3', self_hosted_h3:'可用', cloud_h3:'可用'}});
   });
   await page.route('**/api/projects/station-film/jobs', route => route.fulfill({json:[{
     id:'TEST-ONLY-original-failed-job', status:'failed',
-    metadata:{provider:'runninghub', error_category:'NETWORK_ERROR'},
-    snapshot:{task:{clip_id:'A', task_mode:'MULTI_SHOT_ONE_PASS', source_brief:{id:'brief:A', version:1}},
-      cost_estimate:{provider:'runninghub'}}
+    metadata:{provider:'darl', error_category:'NETWORK_ERROR'},
+    snapshot:{task:{clip_id:'A', task_mode:'MULTI_SHOT_ONE_PASS', source_brief:{id:'brief:A', version:1},
+      provider:'darl', model_profile:{id:'h3-darl-cloud',version:1},
+      target_model:'runninghub-minimax-h3', execution_model:'runninghub-minimax-h3'},
+      cost_estimate:{provider:'darl'}}
   }]}));
   await page.route('**/api/projects/station-film/clips/A/readiness', route => route.fulfill({
     json:{status:'NOT_READY', reasons:[{code:'MISSING_FIELD', field:'purpose'}], brief_version:2}
@@ -198,7 +207,7 @@ test('TEST ONLY technical retry uses original provider and ignores latest Brief 
   }));
   await page.goto('/projects/station-film/04');
   await page.getByRole('button', {name:/Clip A/}).click();
-  await page.getByRole('combobox', {name:'本次视频服务'}).selectOption('darl');
+  await expect(page.getByText('技术重试固定使用原路线：云端 H3 · 备用', {exact:false})).toBeVisible();
   const retry = page.getByRole('button', {name:'技术重试一条'});
   await expect(retry).toBeEnabled();
   const requestPromise = page.waitForRequest(request => request.method()==='POST' && request.url().includes('/clips/A/generate?'));
@@ -208,4 +217,43 @@ test('TEST ONLY technical retry uses original provider and ignores latest Brief 
   expect(parameters.get('retry_of')).toBe('TEST-ONLY-original-failed-job');
   expect(parameters.has('provider')).toBe(false);
   expect(parameters.has('creative_reason')).toBe(false);
+});
+
+test('TEST ONLY frozen self-hosted retry is disabled when only cloud route is available', async ({page}) => {
+  await page.route('**/api/providers', route => route.fulfill({json:{h3:'可用', provider:'darl',
+    execution_model:'runninghub-minimax-h3', execution_route:'云端 H3 · 备用',
+    self_hosted_h3:'服务未启动', cloud_h3:'可用'}}));
+  await page.route('**/api/projects/station-film/jobs', route => route.fulfill({json:[{
+    id:'TEST-ONLY-local-failed-job', status:'failed', metadata:{provider:'darl',error_category:'NETWORK_ERROR'},
+    snapshot:{task:{clip_id:'A', provider:'darl', model_profile:{id:'h3-darl',version:1},
+      target_model:'MiniMax-H3', execution_model:'MiniMax-H3'}, cost_estimate:{provider:'darl'}}
+  }]}));
+  await page.goto('/projects/station-film/04');
+  await page.getByRole('button', {name:/Clip A/}).click();
+  await expect(page.locator('.execution-route')).toContainText('云端 H3 · 备用');
+  await expect(page.getByText('技术重试固定使用原路线：自建 H3', {exact:false})).toBeVisible();
+  await expect(page.getByRole('button', {name:'技术重试一条'})).toBeDisabled();
+});
+
+test('TEST ONLY legacy jobs stay read-only in Creator and Admin', async ({page}) => {
+  const legacy = 'runninghub-minimax-h3'.split('-')[0];
+  await page.route('**/api/projects/station-film/jobs', route => route.fulfill({json:[{
+    id:'TEST-ONLY-legacy-job', status:'failed', metadata:{provider:legacy,error_category:'NETWORK_ERROR'},
+    snapshot:{task:{clip_id:'A',model_profile:{id:'h3-'+legacy,version:1}},cost_estimate:{provider:legacy}}
+  }]}));
+  await page.route('**/api/admin/jobs*', route => route.fulfill({json:[{
+    id:'TEST-ONLY-legacy-job', status:'failed',provider:legacy,legacy_provider:true,
+    project_id:'station-film',clip_id:'A',task_id:'TEST-ONLY-legacy-task',error_category:'NETWORK_ERROR'
+  }]}));
+  await page.goto('/projects/station-film/04');
+  await page.getByRole('button', {name:/Clip A/}).click();
+  await expect(page.getByText('旧 Provider 任务仅供历史查看，不能技术重试。')).toBeVisible();
+  await expect(page.getByRole('button', {name:'技术重试一条'})).toHaveCount(0);
+  await page.goto('/admin');
+  await expect(page.getByText('旧 Provider · 只读')).toBeVisible();
+  await expect(page.getByRole('button', {name:'技术重试',exact:true})).toHaveCount(0);
+  await expect(page.getByText('Darl H3',{exact:true})).toBeVisible();
+  await expect(page.getByText(legacy+' H3', {exact:true})).toHaveCount(0);
+  await expect(page.getByText('自建 H3 · 服务未启动',{exact:false})).toBeVisible();
+  await expect(page.getByText('云端 H3 · 备用 · 未配置',{exact:false})).toBeVisible();
 });

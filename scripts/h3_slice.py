@@ -15,15 +15,16 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from film_core import Core, DomainError
-from film_core.darl_h3 import DarlH3Adapter, ProviderError
+from film_core.darl_h3 import DarlH3Adapter, ProviderError, darl_execution_model
 from film_core.fixture import seed
-from film_core.h3_profile import darl_h3_profile
+from film_core.h3_profile import LOCAL_H3_MODEL, H3_EXECUTION_MODELS, H3_PROFILE_IDS, current_h3_execution_model, darl_h3_profile
+from apps.api.job_runtime import generation_provider
 
 ROOT = Path(__file__).resolve().parents[1]
 RUN = ROOT / "output" / "h3-002-2026-10-09"
 DB = RUN / "production.sqlite"
 PROFILE_ID = "h3-darl"
-PARAMETERS = {"resolution": "768P", "num_inference_steps": 20,
+PARAMETERS = {"resolution": "480P", "num_inference_steps": 20,
               "turbo": False, "watermark": False}
 
 
@@ -56,23 +57,42 @@ def prepare():
 
 def submit_one(clip, adapter, technical_retry_of=None, backend_repaired=False):
     core = core_open()
+    previous = None
     prior = core.db.execute("SELECT COUNT(*) FROM jobs WHERE task_id IN (SELECT id FROM compiled_tasks WHERE clip_id=?)",
                             (clip,)).fetchone()[0]
-    if prior:
+    if prior or technical_retry_of:
         if not technical_retry_of or not backend_repaired or prior >= 2:
             raise DomainError("cost guard: retry requires explicit failed Job and repaired backend; max two attempts")
         previous = core.job(technical_retry_of)
         if previous["status"] != "failed" or previous["snapshot"]["task"]["clip_id"] != clip:
             raise DomainError("technical retry source must be a failed Job for the same Clip")
+        generation_provider(previous)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    task_id = "task-" + clip + "-" + stamp
     job_id = "job-" + clip + "-" + stamp
-    continuation = None
-    if clip == "C2":
-        continuation = core.continuation_source("C1", "tail-C1")
-    task = core.compile_h3(task_id, "brief:" + clip, PROFILE_ID,
-                           parameters=PARAMETERS, continuation=continuation)
-    check = core.preflight(task_id)
+    if previous:
+        task_id = previous['task_id']
+        task = core.task(task_id)
+        execution_model = darl_execution_model(previous['snapshot']['task'])
+        if execution_model == LOCAL_H3_MODEL and os.getenv('H3_SERVER_ON') != '1':
+            raise DomainError('EXECUTION_MODEL_UNAVAILABLE: technical retry cannot switch execution model')
+    else:
+        execution_model = current_h3_execution_model()
+        profile_id = H3_PROFILE_IDS[execution_model]
+        try:
+            profile = core.get('model_profile', profile_id)['payload']
+        except DomainError:
+            profile = darl_h3_profile(execution_model=execution_model)
+            core.put('model_profile', profile_id, profile, 'darl-routing', 'documented')
+        if profile['model_id'] != execution_model:
+            raise DomainError('Darl execution model profile mismatch')
+        if profile.get('provider') != 'darl' or profile.get('execution_model') != execution_model:
+            core.put('model_profile', profile_id, {**profile, 'provider': 'darl', 'execution_model': execution_model},
+                     'darl-routing', 'documented')
+        task_id = "task-" + clip + "-" + stamp
+        continuation = core.continuation_source("C1", "tail-C1") if clip == 'C2' else None
+        task = core.compile_h3(task_id, "brief:" + clip, profile_id,
+                               parameters=PARAMETERS, continuation=continuation)
+    check = core.preflight(task_id, retry_of=technical_retry_of)
     if not check.ready:
         raise DomainError("preflight failed: " + json.dumps(check.reasons, ensure_ascii=False))
     # Official public rate is only an estimate; this self-hosted proxy may bill differently.
@@ -80,9 +100,11 @@ def submit_one(clip, adapter, technical_retry_of=None, backend_repaired=False):
                      if clip == "C2" else 0)
     estimate = {"reference_rate": "MiniMax official 768P $0.08/output second plus video input",
                 "estimated_usd": round((task["duration"] + input_seconds) * 0.08, 2),
-                "proxy_actual_rate": "unknown", "candidate_limit": 1}
+                "proxy_actual_rate": "unknown", "candidate_limit": 1,
+                "provider": "darl", "execution_model": execution_model,
+                "attempt_kind": "technical_retry" if technical_retry_of else "initial"}
     body = adapter.build_request(task)
-    if body["model"] != "MiniMax-H3":
+    if body["model"] != execution_model:
         raise DomainError("model mismatch")
     if clip == "A" and len(body["content"]) != 1:
         raise DomainError("Clip A must be T2VA with one text item")
@@ -92,10 +114,12 @@ def submit_one(clip, adapter, technical_retry_of=None, backend_repaired=False):
     try:
         response = adapter.submit(task, job_id)
     except ProviderError as exc:
-        core.job_event(job_id, "failed", {"provider_error": exc.as_dict(),
+        core.job_event(job_id, "failed", {"provider": "darl", "execution_model": execution_model,
+                                           "provider_error": exc.as_dict(),
                                            "note": "no automatic resubmit; uncertain network result needs manual audit"})
         raise
-    core.job_event(job_id, "running", {"provider_task_id": response["id"],
+    core.job_event(job_id, "running", {"provider": "darl", "execution_model": execution_model,
+                                        "provider_task_id": response["id"],
                                         "create_response": response,
                                         "request_summary": {"model": body["model"], "duration": body["duration"],
                                                             "ratio": body["ratio"], "resolution": body["resolution"],
@@ -212,6 +236,10 @@ def make_preview():
 def sync_one(job_id, adapter):
     core = core_open()
     job = core.job(job_id)
+    generation_provider(job)
+    execution_model = darl_execution_model(job['snapshot']['task'])
+    if execution_model == LOCAL_H3_MODEL and os.getenv('H3_SERVER_ON') != '1':
+        raise DomainError('EXECUTION_MODEL_UNAVAILABLE')
     if job["status"] in {"succeeded", "failed", "cancelled"}:
         raise DomainError("job already terminal")
     provider_id = job["metadata"].get("provider_task_id")
@@ -220,7 +248,8 @@ def sync_one(job_id, adapter):
     response = adapter.poll(provider_id)
     state = response["status"]
     if state == "failed":
-        core.job_event(job_id, "failed", {"provider_task_id": provider_id,
+        core.job_event(job_id, "failed", {"provider": "darl", "execution_model": execution_model,
+                                          "provider_task_id": provider_id,
                                           "query_response": response})
         print(json.dumps({"status": "FAILED", "job_id": job_id, "provider": response}, ensure_ascii=False))
     elif state == "succeeded":
@@ -229,14 +258,17 @@ def sync_one(job_id, adapter):
         info = adapter.download(provider_id, target)
         media_id = "media-" + provider_id
         core.register_media(media_id, **{k: v for k, v in info.items() if k != "metadata"},
-                            metadata={**info.get("metadata", {}), "provider_task_id": provider_id})
-        core.job_event(job_id, "succeeded", {"provider_task_id": provider_id,
+                            metadata={**info.get("metadata", {}), "provider": "darl",
+                                      "execution_model": execution_model, "provider_task_id": provider_id})
+        core.job_event(job_id, "succeeded", {"provider": "darl", "execution_model": execution_model,
+                                             "provider_task_id": provider_id,
                                              "query_response": response, "media_id": media_id})
         take_id = "take-" + provider_id
         core.record_take(take_id, job_id, info["local_path"],
                          provider_metadata=response, media_id=media_id)
-        if core.get("model_profile", PROFILE_ID)["payload"].get("verification_stage") != "REAL_REQUEST_CONFIRMED":
-            core.put("model_profile", PROFILE_ID, darl_h3_profile(True),
+        profile_id = job['snapshot']['task']['model_profile']['id']
+        if core.get("model_profile", profile_id)["payload"].get("verification_stage") != "REAL_REQUEST_CONFIRMED":
+            core.put("model_profile", profile_id, darl_h3_profile(True, execution_model=execution_model),
                      "real-request-" + provider_id, "verified")
         print(json.dumps({"status": "TAKE_READY_FOR_HUMAN_REVIEW", "clip": clip,
                           "take_id": take_id, "job_id": job_id, "media": info}, ensure_ascii=False))
@@ -248,7 +280,7 @@ def sync_one(job_id, adapter):
 
 def models(adapter):
     result = adapter._request("GET", "/v1/models")
-    names = [item.get("id") for item in result.get("data", []) if "MiniMax-H3" in item.get("id", "")]
+    names = [item.get("id") for item in result.get("data", []) if item.get("id") in H3_EXECUTION_MODELS]
     print(json.dumps({"MiniMax_H3_model_ids": names}, ensure_ascii=False))
 
 

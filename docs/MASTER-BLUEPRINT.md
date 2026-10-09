@@ -357,6 +357,16 @@ Profile 应表达：
 
 不能把经验说成官方硬限制。
 
+### 当前 H3 执行路线：Darl-Only【已冻结 / D030】
+
+- 唯一视频 Provider：`darl`；所有 H3 execution models 由 `https://api.darl.cn` 的 `POST /v1/videos` 执行。
+- `H3_SERVER_ON=1` 时，新生成使用 `MiniMax-H3`（自建 H3）；否则使用 `runninghub-minimax-h3`（云端 H3 · 备用）。这是同一 Provider 下的 execution model 选择，不是 Provider 切换。
+- Creator 只展示当前执行路线，Admin 在 Darl 下展示两个 execution models；不保留任何旧备用直连配置、Adapter、工作流或前台 Provider 选择。
+- Final Brief 保持 model-independent；实际 Provider / execution model 写入 Compiled Task 与 Job 不可变快照。
+- Technical Retry 使用原 Provider、原 Compiled Task、原 execution model、参数与引用。原自建模型关闭时安全拒绝，不能自动转云端；新路线需要明确的 Creative Regenerate。
+- 历史非 Darl Provider Job 不删除或迁移，仅供查看；现行系统以 `LEGACY_PROVIDER_UNSUPPORTED` 拒绝继续执行和重试。
+- 两个模型的真实输出、连续性与真实影片验证仍需要独立验收；离线合同测试不等于真实影片 PASS。
+
 ---
 
 ## 10. Reference Contract【已冻结】

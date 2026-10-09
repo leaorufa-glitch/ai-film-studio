@@ -369,6 +369,8 @@ class Core:
         prompt = self._render_h3_prompt(p, sections, refs, continuation)
         return {
             "id": task_id, "clip_id": p["clip_id"], "target_model": profile["payload"]["model_id"],
+            "execution_model": profile["payload"].get("execution_model", profile["payload"]["model_id"]),
+            **({"provider": profile["payload"]["provider"]} if profile["payload"].get("provider") else {}),
             "task_mode": p["handoff"], "compiled_prompt": prompt, "sections": sections,
             "media_bindings": refs, "duration": p["duration"], "aspect_ratio": aspect_ratio,
             "continuation": continuation, "parameters": parameters,

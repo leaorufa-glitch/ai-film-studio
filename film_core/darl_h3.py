@@ -10,6 +10,19 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from .core import DomainError
+from .h3_profile import H3_EXECUTION_MODELS
+
+
+def darl_execution_model(task):
+    model = task.get("execution_model", task.get("target_model"))
+    if model not in H3_EXECUTION_MODELS or model != task.get("target_model"):
+        raise DomainError("execution model mismatch: no silent substitution")
+    profile_model = task.get("model_profile_snapshot", {}).get("model_id", model)
+    if profile_model != model:
+        raise DomainError("execution model differs from frozen profile")
+    if task.get("provider", "darl") != "darl":
+        raise DomainError("LEGACY_PROVIDER_UNSUPPORTED")
+    return model
 
 
 class ProviderError(RuntimeError):
@@ -76,8 +89,7 @@ class DarlH3Adapter:
         return "data:%s;base64,%s" % (mime, base64.b64encode(path.read_bytes()).decode("ascii"))
 
     def build_request(self, task):
-        if task["target_model"] != "MiniMax-H3":
-            raise DomainError("model mismatch: no silent substitution")
+        execution_model = darl_execution_model(task)
         params = task["parameters"]
         if params.get("turbo") and params.get("num_inference_steps") != 4:
             raise DomainError("Darl H3 Turbo requires exactly 4 steps")
@@ -128,7 +140,7 @@ class DarlH3Adapter:
         if any(counts[k] > limits[k] for k in counts):
             raise DomainError("media count exceeds H3 profile")
         ratio = "adaptive" if counts["first_frame"] or counts["last_frame"] else task["aspect_ratio"]
-        body = {"model": task["target_model"], "content": content,
+        body = {"model": execution_model, "content": content,
                 "duration": task["duration"], "ratio": ratio,
                 "resolution": params["resolution"],
                 "num_inference_steps": params["num_inference_steps"],

@@ -120,9 +120,11 @@ class CreatorApiTests(unittest.TestCase):
         self.assertEqual(self.client.get('/api/projects/station-film/clips/A/readiness').json()['status'], 'READY')
         with patch.dict(os.environ, {'DARL_API_KEY': 'test-key'}, clear=False):
             os.environ.pop('H3_SERVER_ON', None)
-            self.assertEqual(self.client.get('/api/providers').json()['h3'], '服务未启动')
+            status = self.client.get('/api/providers').json()
+            self.assertEqual(status['h3'], '可用')
+            self.assertEqual(status['execution_model'], 'runninghub-minimax-h3')
             blocked = self.client.post('/api/projects/station-film/clips/A/generate')
-        self.assertEqual(blocked.status_code, 503)
+        self.assertEqual(blocked.status_code, 400)
         self.assertEqual(len(self.client.get('/api/projects/station-film/jobs').json()), 1)
 
     def test_generate_compiles_brief_and_surfaces_provider_failure(self):

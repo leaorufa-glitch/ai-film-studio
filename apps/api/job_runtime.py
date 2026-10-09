@@ -13,8 +13,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from film_core import Core, DomainError
-from film_core.darl_h3 import DarlH3Adapter, ProviderError
-from .runninghub_h3 import RunningHubH3Adapter
+from film_core.darl_h3 import DarlH3Adapter, ProviderError, darl_execution_model
+from film_core.h3_profile import H3_PROFILE_IDS, LOCAL_H3_MODEL
 
 log=logging.getLogger('film_studio.job_runtime')
 
@@ -23,15 +23,31 @@ def utcnow():
     return datetime.now(timezone.utc)
 
 
+def generation_provider(job):
+    task = job['snapshot']['task']
+    providers = {provider for provider in (
+        job['metadata'].get('provider'), task.get('provider'),
+        (job['snapshot'].get('cost_estimate') or {}).get('provider')) if provider}
+    profile_id = task.get('model_profile', {}).get('id')
+    if profile_id in H3_PROFILE_IDS.values():
+        providers.add('darl')
+    if providers != {'darl'} or profile_id not in H3_PROFILE_IDS.values():
+        raise DomainError('LEGACY_PROVIDER_UNSUPPORTED')
+    model = darl_execution_model(task)
+    models = [job['metadata'].get('execution_model'),
+              (job['snapshot'].get('cost_estimate') or {}).get('execution_model')]
+    if any(value and value != model for value in models):
+        raise DomainError('original Job execution model is inconsistent')
+    return 'darl'
+
+
 class JobWorker:
     def __init__(self, db_path, media_root, *, test_mode=False, adapter_factory=DarlH3Adapter,
-                 runninghub_factory=RunningHubH3Adapter,
                  poll_seconds=180, max_transient=3, max_download=2):
         self.db_path=str(db_path)
         self.media_root=Path(media_root)
         self.test_mode=test_mode
         self.adapter_factory=adapter_factory
-        self.runninghub_factory=runninghub_factory
         self.poll_seconds=max(0,poll_seconds) if test_mode else max(180,poll_seconds)
         self.max_transient=max(1,max_transient)
         self.max_download=max(1,max_download)
@@ -53,6 +69,8 @@ class JobWorker:
             c.db.execute('DELETE FROM generation_requests WHERE job_id IS NULL AND created_at<datetime("now","-10 minutes")')
             jobs=[c.job(r['id']) for r in c.db.execute('SELECT id FROM jobs ORDER BY created_at')]
             for job in jobs:
+                try:generation_provider(job)
+                except DomainError:continue
                 jid=job['id']
                 if job['status']=='running':
                     provider_id=job['metadata'].get('provider_task_id')
@@ -63,9 +81,8 @@ class JobWorker:
                     event=c.db.execute('SELECT created_at FROM job_events WHERE job_id=? ORDER BY id DESC LIMIT 1',(jid,)).fetchone()
                     try:resume_at=max(utcnow(),datetime.fromisoformat(event['created_at'])+timedelta(seconds=self.poll_seconds))
                     except (TypeError,ValueError):resume_at=utcnow()+timedelta(seconds=self.poll_seconds)
-                    provider=job['metadata'].get('provider') or (job['snapshot'].get('cost_estimate') or {}).get('provider','darl')
                     c.db.execute('INSERT OR IGNORE INTO job_runtime(job_id,provider,provider_task_id,next_poll_at,submitted_at) VALUES (?,?,?,?,?)',
-                                 (jid,provider,provider_id,resume_at.isoformat(),job['created_at']))
+                                 (jid,'darl',provider_id,resume_at.isoformat(),job['created_at']))
                 elif job['status']=='queued':
                     c.job_event(jid,'failed',{'error_category':'SUBMISSION_UNKNOWN','message':'Submit was interrupted before task id; no automatic resubmit'})
                     c.db.execute('DELETE FROM active_generation WHERE job_id=?',(jid,))
@@ -95,7 +112,7 @@ class JobWorker:
     def tick(self):
         c=self._core()
         try:
-            due=c.db.execute('SELECT job_id FROM job_runtime WHERE next_poll_at<=? AND (lease_until IS NULL OR lease_until<?) ORDER BY next_poll_at LIMIT 3',
+            due=c.db.execute("SELECT job_id FROM job_runtime WHERE provider='darl' AND next_poll_at<=? AND (lease_until IS NULL OR lease_until<?) ORDER BY next_poll_at LIMIT 3",
                              (utcnow().isoformat(),utcnow().isoformat())).fetchall()
             for row in due:
                 jid=row['job_id']
@@ -117,28 +134,26 @@ class JobWorker:
 
     def _poll_one(self,c,jid):
         job=c.job(jid)
+        try:generation_provider(job)
+        except DomainError:return
         if job['status']!='running':
             c.db.execute('UPDATE job_runtime SET next_poll_at=NULL WHERE job_id=?',(jid,));c.db.commit();return
         runtime=c.db.execute('SELECT * FROM job_runtime WHERE job_id=?',(jid,)).fetchone()
-        provider=runtime['provider'] or job['metadata'].get('provider') or 'darl'
-        flag='h3_enabled' if provider=='darl' else 'runninghub_enabled'
-        enabled=c.db.execute('SELECT value FROM system_config WHERE key=?',(flag,)).fetchone()
-        offline=(provider=='darl' and os.getenv('H3_SERVER_ON')!='1')
+        if runtime['provider'] != 'darl':return
+        enabled=c.db.execute("SELECT value FROM system_config WHERE key='h3_enabled'").fetchone()
+        offline=(darl_execution_model(job['snapshot']['task']) == LOCAL_H3_MODEL and os.getenv('H3_SERVER_ON')!='1')
         if not self.test_mode and (offline or enabled and enabled['value']=='false'):
             c.db.execute('UPDATE job_runtime SET next_poll_at=?,last_error_category=? WHERE job_id=?',
                          (self._schedule(0),'PROVIDER_OFFLINE',jid));c.db.commit();return
-        credentials_ready=(bool(os.getenv('DARL_API_KEY')) if provider=='darl' else
-                           bool(os.getenv('RUNNINGHUB_API_KEY') and os.getenv('RUNNINGHUB_WEBAPP_ID')))
+        credentials_ready=bool(os.getenv('DARL_API_KEY'))
         if not credentials_ready:
             c.db.execute('UPDATE job_runtime SET next_poll_at=?,last_error_category=? WHERE job_id=?',
                          (self._schedule(0),'PROVIDER_NOT_CONFIGURED',jid));c.db.commit();return
         try:
-            adapter=self.adapter_factory() if provider=='darl' else self.runninghub_factory() if provider=='runninghub' else None
+            adapter=self.adapter_factory()
         except DomainError:
             c.db.execute('UPDATE job_runtime SET next_poll_at=?,last_error_category=? WHERE job_id=?',
                          (self._schedule(0),'PROVIDER_NOT_CONFIGURED',jid));c.db.commit();return
-        if adapter is None:
-            self._fail(c,jid,'UNKNOWN_PROVIDER','任务使用的 Provider 不受支持。');return
         provider_id=runtime['provider_task_id']
         try:
             poll_started=time.monotonic()
@@ -182,12 +197,14 @@ class JobWorker:
                 c.register_media(media_id,info['local_path'],info['sha256'],info['size_bytes'],info['mime'],
                                  duration=info.get('duration'),metadata={**info.get('metadata',{}),
                                  'kind':'video_take','source':'provider','provider':runtime['provider'],
+                                 'execution_model':darl_execution_model(task),
                                  'project_id':self._project_for_clip(c,task['clip_id']),
                                  'clip_id':task['clip_id'],'job_id':jid,'width':width,'height':height,
                                  'test_only':self.test_mode})
             c.job_event(jid,'succeeded',{'provider':runtime['provider'],'provider_task_id':provider_id,'media_id':media_id,
-                                        'provider_status':'succeeded'})
-            c.record_take('take-'+jid,jid,str(target),{'provider':runtime['provider'],'provider_task_id':provider_id},
+                                        'provider_status':'succeeded','execution_model':darl_execution_model(task)})
+            c.record_take('take-'+jid,jid,str(target),{'provider':runtime['provider'],'provider_task_id':provider_id,
+                                                     'execution_model':darl_execution_model(task)},
                           test_only=self.test_mode,media_id=media_id)
             c.db.execute('UPDATE job_runtime SET completed_at=?,next_poll_at=NULL,last_error_category=NULL,download_latency_ms=? WHERE job_id=?',
                          (utcnow().isoformat(),round((time.monotonic()-download_started)*1000),jid))

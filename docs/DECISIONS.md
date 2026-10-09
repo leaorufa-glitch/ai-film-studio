@@ -34,3 +34,4 @@
 | D027 | H3 / Seedance 的硬限制必须按当前官方/真实 API 再验证 | Validate | 模型能力会变化，不能靠记忆 |
 | D028 | 自建 H3 生产服务器按需开关机；在已确认关机时，`fail_to_fetch_task` / HTTP 404 归类为预期的 `provider unavailable`，保留失败 Job 与执行证据 | Frozen | 停机节省资源是既定运行方式；不能把本次预期离线误判为未知路由故障或伪造成成功 |
 | D029 | #002 Real H3 Film Validation 标记为 `DEFERRED / EXPECTED_INFRASTRUCTURE_OFFLINE`；不重试现有 Clip A；A+B+C1+C2 真实影片验收延期到正式网站 Generation Flow 接通之后 | Frozen | 先完成正式网站中的生成流程，再按需启动 H3 服务器执行影片验收；这是本次对 D025 顺序的明确例外，#002 未获 System/Film PASS |
+| D030 | Darl-Only H3 Routing：唯一视频 Provider 为 `darl`，统一使用 `https://api.darl.cn/v1/videos`；新的生成按 `H3_SERVER_ON` 选择自建 `MiniMax-H3` 或云端备用 `runninghub-minimax-h3`，前台明确展示执行路线 | Frozen | Provider 与 execution model 分离，撤销旧备用直连能力；Final Brief 不变，Task / Job 冻结实际执行模型。Technical Retry 不切换模型，旧非 Darl Job 只读并以 `LEGACY_PROVIDER_UNSUPPORTED` 拒绝重试；真实影片验证仍未完成 |

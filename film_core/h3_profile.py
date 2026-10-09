@@ -1,17 +1,29 @@
-"""Documented H3 capability for Darl's self-hosted New API transport (#002).
+"""Documented H3 capability for Darl's New API transport.
 
 Official model limits and proxy-specific options are intentionally distinguished.
 Runtime validation promotes a new immutable profile version after a real request.
 """
 from datetime import date
+import os
 
 OFFICIAL_CREATE = "https://platform.minimax.io/docs/api-reference/video-generation-v2-create"
 PROXY_GUIDE = "https://fwr0187eq6.apifox.cn/9352472m0"
+LOCAL_H3_MODEL = "MiniMax-H3"
+CLOUD_H3_MODEL = "runninghub-minimax-h3"
+H3_EXECUTION_MODELS = {LOCAL_H3_MODEL: "自建 H3", CLOUD_H3_MODEL: "云端 H3 · 备用"}
+H3_PROFILE_IDS = {LOCAL_H3_MODEL: "h3-darl", CLOUD_H3_MODEL: "h3-darl-cloud"}
 
 
-def darl_h3_profile(runtime_verified=False):
+def current_h3_execution_model():
+    return LOCAL_H3_MODEL if os.getenv("H3_SERVER_ON") == "1" else CLOUD_H3_MODEL
+
+
+def darl_h3_profile(runtime_verified=False, execution_model=LOCAL_H3_MODEL):
+    if execution_model not in H3_EXECUTION_MODELS:
+        raise ValueError("unsupported Darl H3 execution model")
     return {
-        "family": "H3", "model_id": "MiniMax-H3", "model_version": "H3 via Darl local V2",
+        "family": "H3", "model_id": execution_model, "model_version": "H3 via Darl V2",
+        "provider": "darl", "execution_model": execution_model,
         "source": {"official_model": OFFICIAL_CREATE, "proxy_transport": PROXY_GUIDE},
         "verified_at": date.today().isoformat(),
         "verification_stage": "REAL_REQUEST_CONFIRMED" if runtime_verified else "DOCUMENTED_PENDING_REAL_REQUEST",
