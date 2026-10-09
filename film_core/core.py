@@ -502,19 +502,42 @@ class Core:
                               (clip_id,)).fetchone()
         return dict(row) if row else None
 
-    def preflight(self, task_id):
+    def preflight(self, task_id, retry_of=None):
         task = self.task(task_id)
+        if retry_of:
+            previous = self.job(retry_of)
+            original = previous["snapshot"].get("task")
+            if (previous["status"] != "failed" or not isinstance(original, dict) or
+                    self.task(previous["task_id"]) != original or
+                    {**original, "id": task_id} != task):
+                raise DomainError("technical retry requires unchanged original failed Job inputs")
+            try:
+                for kind, source in (("brief", task["source_brief"]),
+                                     ("model_profile", task["model_profile"])):
+                    if not isinstance(source["version"], int) or source["version"] < 1:
+                        raise DomainError("original version missing")
+                    self.get(kind, source["id"], source["version"])
+                for binding in task["media_bindings"]:
+                    if not isinstance(binding["version"], int) or binding["version"] < 1:
+                        raise DomainError("original reference version missing")
+                    reference = self.get("reference_binding", binding["id"], binding["version"])
+                    if {"id": reference["id"], "version": reference["version"], **reference["payload"]} != binding:
+                        raise DomainError("original reference snapshot mismatch")
+            except (DomainError, KeyError, TypeError):
+                raise DomainError("technical retry original inputs unavailable; use Creative Regenerate") from None
         profile = self.get("model_profile", task["model_profile"]["id"],
                            task["model_profile"]["version"])["payload"]
         reasons = []
         def fail(code, field):
             reasons.append({"code": code, "field": field})
-        if self.get("brief", task["source_brief"]["id"])["version"] != task["source_brief"]["version"]:
+        if retry_of and task.get("model_profile_snapshot") != profile:
+            fail("RETRY_PROFILE_SNAPSHOT_MISMATCH", "model_profile")
+        if not retry_of and self.get("brief", task["source_brief"]["id"])["version"] != task["source_brief"]["version"]:
             fail("BRIEF_VERSION_STALE", "source_brief")
-        if self.get("model_profile", task["model_profile"]["id"])["version"] != task["model_profile"]["version"]:
+        if not retry_of and self.get("model_profile", task["model_profile"]["id"])["version"] != task["model_profile"]["version"]:
             fail("PROFILE_VERSION_STALE", "model_profile")
         for binding in task["media_bindings"]:
-            if self.get("reference_binding", binding["id"])["version"] != binding["version"]:
+            if not retry_of and self.get("reference_binding", binding["id"])["version"] != binding["version"]:
                 fail("REFERENCE_VERSION_STALE", binding["id"])
         if task["task_mode"] not in profile.get("supported_modes", []):
             fail("MODE_UNVERIFIED_OR_UNSUPPORTED", "task_mode")
@@ -535,7 +558,8 @@ class Core:
                 if not binding.get("role") or not (binding.get("asset_id") or binding.get("control_media_id")):
                     fail("INVALID_REFERENCE_BINDING", "media_bindings")
                 try:
-                    source = (self.get("asset_version", binding["asset_id"])["payload"]
+                    source = (self.get("asset_version", binding["asset_id"],
+                                       binding.get("asset_version") if retry_of else None)["payload"]
                               if binding.get("asset_id") else
                               self.get("control_media", binding["control_media_id"])["payload"])
                     if not binding.get("uri") and not source.get("uri"):
@@ -621,7 +645,7 @@ class Core:
         return QAResult("READY" if not reasons else "NOT_READY", tuple(reasons))
 
     def create_job(self, job_id, task_id, retry_of=None, cost_estimate=None):
-        result = self.preflight(task_id)
+        result = self.preflight(task_id, retry_of=retry_of)
         if not result.ready:
             raise DomainError("preflight failed: " + encoded(result.reasons))
         task = self.task(task_id)

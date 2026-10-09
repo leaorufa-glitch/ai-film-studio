@@ -77,8 +77,10 @@ class ProductionCoreTests(unittest.TestCase):
         self.assertEqual(c.get("brief", "brief:A", 1)["payload"], original["payload"])
         self.assertEqual(c.take("historical-take")["job_id"], "completed-job")
         self.assertEqual(c.impact(task["id"]), "Must Replan / Rebuild")
+        historical_retry = c.create_job("historical-retry", task["id"], retry_of="failed-job")
+        self.assertEqual(historical_retry["snapshot"]["task"], task)
         with self.assertRaises(DomainError):
-            c.create_job("stale-retry", task["id"], retry_of="failed-job")
+            c.create_job("stale-initial", task["id"])
         self.assertEqual(retry["snapshot"]["retry_of"], "failed-job")
         self.assertEqual(retry["snapshot"]["task"]["source_brief"]["version"], 1)
         self.assertEqual(retry["snapshot"]["task"]["compiler_version"], "h3-compiler/0.1")

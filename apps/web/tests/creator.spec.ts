@@ -177,3 +177,35 @@ test('local H3 offline offers RunningHub explicitly and keeps continuation block
   await expect(continuation.getByRole('option', {name:/RunningHub H3/})).toHaveAttribute('disabled', '');
   await expect(continuation).toContainText('参考视频不等于同一长镜头续接');
 });
+
+test('TEST ONLY technical retry uses original provider and ignores latest Brief readiness', async ({page}) => {
+  await page.route('**/api/providers', async route => {
+    const response = await route.fetch();
+    const data = await response.json();
+    await route.fulfill({response, json:{...data, h3:'服务未启动', runninghub_h3:'可用'}});
+  });
+  await page.route('**/api/projects/station-film/jobs', route => route.fulfill({json:[{
+    id:'TEST-ONLY-original-failed-job', status:'failed',
+    metadata:{provider:'runninghub', error_category:'NETWORK_ERROR'},
+    snapshot:{task:{clip_id:'A', task_mode:'MULTI_SHOT_ONE_PASS', source_brief:{id:'brief:A', version:1}},
+      cost_estimate:{provider:'runninghub'}}
+  }]}));
+  await page.route('**/api/projects/station-film/clips/A/readiness', route => route.fulfill({
+    json:{status:'NOT_READY', reasons:[{code:'MISSING_FIELD', field:'purpose'}], brief_version:2}
+  }));
+  await page.route('**/api/projects/station-film/clips/A/generate?**', route => route.fulfill({
+    json:{job:{id:'TEST-ONLY-retry-job'}, expected_minutes:3}
+  }));
+  await page.goto('/projects/station-film/04');
+  await page.getByRole('button', {name:/Clip A/}).click();
+  await page.getByRole('combobox', {name:'本次视频服务'}).selectOption('darl');
+  const retry = page.getByRole('button', {name:'技术重试一条'});
+  await expect(retry).toBeEnabled();
+  const requestPromise = page.waitForRequest(request => request.method()==='POST' && request.url().includes('/clips/A/generate?'));
+  await retry.click();
+  const request = await requestPromise;
+  const parameters = new URL(request.url()).searchParams;
+  expect(parameters.get('retry_of')).toBe('TEST-ONLY-original-failed-job');
+  expect(parameters.has('provider')).toBe(false);
+  expect(parameters.has('creative_reason')).toBe(false);
+});
