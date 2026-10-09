@@ -1,6 +1,6 @@
-# #002 H3 Real Vertical Slice — 施工报告（当前未通过）
+# #002 H3 Real Vertical Slice — 施工报告（影片验收延期）
 
-状态：**BLOCKED_AT_REAL_CREATE / System 未通过 / Film 未验收**。本报告记录 2026-10-09 实际施工证据；不得把离线合同测试当作真实影片结果。
+状态：**DEFERRED / EXPECTED_INFRASTRUCTURE_OFFLINE**。System PASS 与 Film PASS 均未验证；本报告记录 2026-10-09 实际施工证据，不把离线合同测试当作真实影片结果。用户已确认自建 H3 生产服务器平时为节省资源处于关机状态，仅在实际生产时开机；本次创建失败属于可识别的预期 `provider unavailable` 状态。
 
 ## 1. 官方 H3 能力验证来源与日期
 
@@ -26,7 +26,7 @@
 
 来源：`station-scene`、S01/S02/S03、Clip A、Final Brief v1 → Brief QA READY → H3 Compiler `h3-compiler/0.1` → Compiled Task → Model Preflight READY。Project 决定 16:9；执行参数 10s、768P、20 步、Turbo=false、无参考素材的 T2VA。计划估算参照 MiniMax 公开 768P 单价约 US$0.80；自建服务实际价格/资源消耗未知。
 
-真实 Compiled Task：`task-A-20261009T084845Z`；Job：`job-A-20261009T084845Z`。Darl 创建接口返回 HTTP 404，业务码 `fail_to_fetch_task`，错误消息为上游“页面未找到”的 HTML。没有返回公开任务 ID；Job 记录为 failed，未自动重提。推测是 Darl MiniMax-H3 渠道上游地址/服务路径不可达，需由渠道配置或服务日志确认；不能仅凭该错误断言一定没有上游任务产生。
+真实 Compiled Task：`task-A-20261009T084845Z`；Job：`job-A-20261009T084845Z`。Darl 创建接口返回 HTTP 404，业务码 `fail_to_fetch_task`，错误消息为上游“页面未找到”的 HTML。没有返回公开任务 ID；Job 记录为 failed，未自动重提。用户随后确认 H3 上游服务器当时未开机；本次失败按运行环境事实归类为预期 `provider unavailable`，不再当作未知路由故障排查。原始失败 Job 和响应证据完整保留，不能伪造成功。
 
 ## 7. Clip A Selection / Canonical State
 
@@ -58,11 +58,11 @@
 
 ## 14. Technical Retry / Creative Regenerate
 
-实际技术提交 1 次、失败 1 次、重试 0 次；创作性重生成 0 次。Runner 限制每 Clip 一次候选；再次提交 A 必须指明失败 Job、显式技术重试且确认渠道已修复。没有自动轮询或无限重试。
+实际技术提交 1 次、失败 1 次、重试 0 次；创作性重生成 0 次。按最新项目决定，**不再对现有 Clip A 做技术重试**。Runner 的既有能力保持原样，本次不调用它再次提交；没有自动轮询或无限重试。
 
 ## 15. 测试结果
 
-`python3 -m unittest discover -s tests -v`：**12 tests passed**，包含 #001 原有 6 项与 #002 离线 Adapter/Media/Dependency 合同 6 项。`python3 -m compileall -q film_core scripts tests` 通过。真实付费调用与普通单元测试分离。真实调用结果是 A 创建失败，**不计为端到端通过**。
+`python3 -m unittest discover -s tests -v`：**12 tests passed**，包含 #001 原有 6 项与 #002 离线 Adapter/Media/Dependency 合同 6 项。`python3 -m compileall -q film_core scripts tests` 通过。真实调用与普通单元测试分离。真实调用结果是 A 创建失败，**不计为端到端通过**。
 
 ## 16. 实际花费 / usage
 
@@ -74,19 +74,19 @@ Darl 未返回公开任务 ID、usage 或账单记录；实际资源消耗未知
 
 ## 18. 已知问题
 
-1. 自建 H3 渠道创建任务时收到上游 404，需检查 Base URL、端口、`/v2/video_generation` 路由以及服务日志。
-2. 首次错误没有公开任务 ID，不能通过 New API 查询该请求是否创建了上游任务。
+1. H3 生产服务器按需开关机；服务离线时 `fail_to_fetch_task` / HTTP 404 是可识别的预期 `provider unavailable`。这是本轮环境分类记录；未修改现有 Adapter 的错误映射。
+2. 首次失败没有公开任务 ID；原始 Job 和响应仍保留，不推断或伪造上游成功结果。
 3. 自建代理实际输出与参考视频连续性的可靠性尚未经真实素材验证。
 4. 本地人工 Selection 使用显式操作者输入；正式网站的身份/权限属后续工作。
 
 ## 19. Git commits
 
-#001 已验收 HEAD：`7517ec08dceb18b8e0a94819dd661806ecca7a6e`；#002 施工单提交：`6aab6cf219908f1ccf9a9947942f7ba336830e04`。本报告与实现提交的最终哈希以提交后的 `git log -1 --format=%H` 为准。
+#001 已验收 HEAD：`7517ec08dceb18b8e0a94819dd661806ecca7a6e`；#002 施工单提交：`6aab6cf219908f1ccf9a9947942f7ba336830e04`；#002 实现与初始报告：`e72a45c97acbfe1f899842fe9956038ae00cb7f8`。本次延期决策提交以提交后的 `git log -1 --format=%H` 为准。
 
 ## 20. 工作区状态
 
-报告提交后以 `git status --porcelain` 实测为准。真实输出数据库/媒体位于忽略的 `output/`，不会进入 Git。
+本次文档提交后以 `git status --porcelain` 实测为准。原失败 Job 与执行数据库保存在忽略的 `output/h3-002-2026-10-09/production.sqlite`；未删除或重置。
 
 ## 21. 范围
 
-明确**没有进入 #003 正式网站**，也没有 Seedance、2K 批量候选、AI 总分或重后期。#002 需在 H3 渠道修复后继续执行四条真实 Clip 与人工影片验收，当前不能宣称 PASS。
+明确**本轮没有进入 #003 正式网站**，也没有 Seedance、2K 批量候选、AI 总分或重后期。A+B+C1+C2 的真实影片验收延期到正式网站 Generation Flow 接通之后，并在 H3 服务器按需开机时进行。当前不能宣称 #002 PASS；下一步等待新的 **#003 Full Creator Website Build** 施工单，本轮停止。
