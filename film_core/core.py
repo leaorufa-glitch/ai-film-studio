@@ -60,6 +60,11 @@ CREATE TABLE IF NOT EXISTS shot_clip (
   clip_start REAL NOT NULL, clip_end REAL NOT NULL, cut_before INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY(clip_id,ordinal), UNIQUE(clip_id,shot_id,shot_start)
 );
+CREATE TABLE IF NOT EXISTS shot_clip_revisions (
+  clip_id TEXT NOT NULL, version INTEGER NOT NULL, mappings TEXT NOT NULL,
+  source TEXT NOT NULL, created_at TEXT NOT NULL,
+  PRIMARY KEY(clip_id,version)
+);
 CREATE TABLE IF NOT EXISTS dependencies (
   clip_id TEXT NOT NULL, upstream_clip_id TEXT NOT NULL, kind TEXT NOT NULL,
   PRIMARY KEY(clip_id,upstream_clip_id,kind)
@@ -168,6 +173,51 @@ class Core:
     def mappings(self, clip_id):
         return [dict(r) for r in self.db.execute(
             "SELECT * FROM shot_clip WHERE clip_id=? ORDER BY ordinal", (clip_id,))]
+
+    def mapping_revision(self, clip_id):
+        return self.db.execute("SELECT COALESCE(MAX(version),0) FROM shot_clip_revisions WHERE clip_id=?",
+                               (clip_id,)).fetchone()[0]
+
+    def replace_mappings(self, clip_id, mappings, source, expected_revision=None):
+        """Replace the live Shot↔Clip plan atomically while preserving prior revisions."""
+        clip = self.get("clip", clip_id)["payload"]
+        current = self.mappings(clip_id)
+        revision = self.mapping_revision(clip_id)
+        if expected_revision is not None and expected_revision != revision:
+            raise DomainError("mapping revision changed")
+        if not source or not isinstance(mappings, list):
+            raise DomainError("invalid mapping revision")
+        if sorted(m["ordinal"] for m in mappings) != list(range(len(mappings))):
+            raise DomainError("mapping ordinals must be consecutive")
+        seen = set()
+        for m in mappings:
+            shot = self.get("shot", m["shot_id"])["payload"]
+            if shot.get("scene_id") != clip.get("scene_id"):
+                raise DomainError("shot and clip must share scene")
+            key = (m["shot_id"], m["shot_start"])
+            if key in seen or not (0 <= m["shot_start"] < m["shot_end"] <= shot["duration"] and
+                0 <= m["clip_start"] < m["clip_end"] <= clip["duration"] and
+                abs((m["shot_end"]-m["shot_start"])-(m["clip_end"]-m["clip_start"])) < 0.001):
+                raise DomainError("invalid shot/clip range")
+            seen.add(key)
+        try:
+            if revision == 0 and current:
+                revision = 1
+                self.db.execute("INSERT INTO shot_clip_revisions VALUES (?,?,?,?,?)",
+                                (clip_id, revision, encoded(current), "pre-website-plan", now()))
+            new_revision = revision + 1
+            self.db.execute("DELETE FROM shot_clip WHERE clip_id=?", (clip_id,))
+            for m in mappings:
+                self.db.execute("INSERT INTO shot_clip VALUES (?,?,?,?,?,?,?,?)", (
+                    clip_id, m["shot_id"], m["ordinal"], m["shot_start"], m["shot_end"],
+                    m["clip_start"], m["clip_end"], int(bool(m.get("cut_before")))))
+            self.db.execute("INSERT INTO shot_clip_revisions VALUES (?,?,?,?,?)",
+                            (clip_id, new_revision, encoded(self.mappings(clip_id)), source, now()))
+            self.db.commit()
+            return {"version": new_revision, "mappings": self.mappings(clip_id)}
+        except Exception:
+            self.db.rollback()
+            raise
 
     def add_dependency(self, clip_id, upstream_clip_id, kind):
         if kind not in {"STATE_CONTINUITY", "VISUAL_ANCHOR", "VIDEO_CONTINUATION"}:

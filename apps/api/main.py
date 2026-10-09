@@ -32,6 +32,9 @@ CREATE TABLE IF NOT EXISTS timeline_items (
 CREATE TABLE IF NOT EXISTS timeline_subtitles (
  id TEXT PRIMARY KEY, project_id TEXT NOT NULL, start REAL NOT NULL, end REAL NOT NULL,
  text TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS asset_current (
+ project_id TEXT NOT NULL, owner_id TEXT NOT NULL, asset_id TEXT NOT NULL, version INTEGER NOT NULL,
+ updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(project_id,owner_id));
 '''
 
 
@@ -114,6 +117,24 @@ class MappingInput(BaseModel):
     cut_before: bool = False
 
 
+class HandoffInput(BaseModel):
+    upstream_clip_id: str
+    kind: str = 'state'
+    at_second: float = 0
+    duration: float = 3
+    assessment: str = ''
+
+
+class AssetCurrentInput(BaseModel):
+    version: int
+
+
+class ReferenceInput(BaseModel):
+    asset_id: str
+    asset_version: int
+    role: str
+
+
 class SelectionInput(BaseModel):
     take_id: str
     actor: str = 'local-creator'
@@ -148,19 +169,21 @@ class SubtitleInput(BaseModel):
     text: str
 
 
-def create_app(db_path: str | Path | None = None, media_root: str | Path | None = None) -> FastAPI:
+def create_app(db_path: str | Path | None = None, media_root: str | Path | None = None,
+               test_mode: bool = False) -> FastAPI:
     path = Path(db_path or os.getenv('FILM_STUDIO_DB') or (DEFAULT_DB if DEFAULT_DB.exists() else ROOT / 'output' / 'studio.sqlite'))
     media_dir = Path(media_root or os.getenv('FILM_STUDIO_MEDIA') or ROOT / 'output' / 'studio-media')
     path.parent.mkdir(parents=True, exist_ok=True)
-    boot = Core(str(path))
+    boot = Core(str(path), test_mode=test_mode)
     boot.db.executescript(APP_SCHEMA)
     boot.close()
     app = FastAPI(title='AI Film Studio API', version='0.3')
-    app.add_middleware(CORSMiddleware, allow_origins=['http://localhost:3000', 'http://127.0.0.1:3000'],
+    app.add_middleware(CORSMiddleware, allow_origins=['http://localhost:3000', 'http://127.0.0.1:3000',
+                                                       'http://localhost:3001', 'http://127.0.0.1:3001'],
                        allow_methods=['*'], allow_headers=['*'])
 
     def execute(fn):
-        core = Core(str(path))
+        core = Core(str(path), test_mode=test_mode)
         try:
             return fn(core)
         except DomainError as exc:
@@ -202,7 +225,7 @@ def create_app(db_path: str | Path | None = None, media_root: str | Path | None 
                 raise DomainError('project title and valid aspect ratio required')
             project_id = uid('project')
             item = c.put('project', project_id, {'title': title, 'aspect_ratio': ratio,
-                'idea': body.payload.get('idea', ''), 'script': body.payload.get('script', ''),
+                'idea': body.payload.get('idea', ''), 'script': body.payload.get('script') or body.payload.get('idea', ''),
                 'preferences': body.payload.get('preferences', '')}, 'creator', 'approved')
             episode = c.put('episode', uid('episode'), {'project_id': project_id, 'number': 1, 'title': '第一集'}, 'creator')
             return {'project': item, 'episode': episode}
@@ -293,7 +316,7 @@ def create_app(db_path: str | Path | None = None, media_root: str | Path | None 
 
     @app.patch('/api/projects/{pid}/world/{kind}/{oid}')
     def world_update(pid: str, kind: str, oid: str, body: VersionedInput):
-        if kind not in {'character', 'character_look', 'location', 'prop', 'asset_version'}:
+        if kind not in {'character', 'character_look', 'location', 'prop'}:
             raise HTTPException(404)
         def op(c):
             belong(c, kind, oid, pid)
@@ -316,23 +339,42 @@ def create_app(db_path: str | Path | None = None, media_root: str | Path | None 
             c.get('project', pid)
             if not any(x['id'] == owner_id for kind in ('character', 'character_look', 'location', 'prop') for x in project_world(c, pid, kind)):
                 raise DomainError('asset owner missing')
-            asset_id = uid('asset')
+            asset_id = 'asset-' + hashlib.sha256((owner_id + '\0' + purpose).encode()).hexdigest()[:16]
             media_dir.mkdir(parents=True, exist_ok=True)
-            dest = media_dir / (asset_id + allowed[file.content_type])
+            dest = media_dir / (uid('upload') + allowed[file.content_type])
             dest.write_bytes(content)
-            return c.put('asset_version', asset_id, {'project_id': pid, 'owner_id': owner_id,
+            item = c.put('asset_version', asset_id, {'project_id': pid, 'owner_id': owner_id,
                 'purpose': purpose, 'uri': str(dest), 'media_type': 'image',
                 'sha256': hashlib.sha256(content).hexdigest(), 'mime': file.content_type}, 'creator-upload')
+            mark_impact(c, pid, 'asset_version', asset_id, None,
+                        '视觉素材有新版本；请检查后续片段是否需要更新参考。')
+            return item
         return execute(op)
 
     @app.get('/api/media-asset/{aid}')
-    def serve_asset(aid: str):
+    def serve_asset(aid: str, version: int | None = None):
         def op(c):
-            asset = c.get('asset_version', aid)['payload']
+            asset = c.get('asset_version', aid, version)['payload']
             target = Path(asset.get('uri', '')).resolve()
             if not target.is_file() or not target.is_relative_to(media_dir.resolve()):
                 raise DomainError('managed asset missing or outside media directory')
             return FileResponse(target, media_type=asset.get('mime', 'image/jpeg'))
+        return execute(op)
+
+    @app.post('/api/projects/{pid}/assets/{aid}/current')
+    def choose_asset(pid: str, aid: str, body: AssetCurrentInput):
+        def op(c):
+            asset = c.get('asset_version', aid, body.version)
+            p = asset['payload']
+            if p.get('project_id') != pid:
+                raise DomainError('asset belongs to another project')
+            c.db.execute('INSERT INTO asset_current(project_id,owner_id,asset_id,version) VALUES (?,?,?,?) '
+                         'ON CONFLICT(project_id,owner_id) DO UPDATE SET asset_id=excluded.asset_id,version=excluded.version,updated_at=CURRENT_TIMESTAMP',
+                         (pid, p['owner_id'], aid, body.version))
+            c.db.commit()
+            mark_impact(c, pid, 'asset_current', aid, None,
+                        '当前视觉版本已切换；相关后续片段需要检查连续性。')
+            return {'owner_id': p['owner_id'], 'asset_id': aid, 'version': body.version}
         return execute(op)
 
     @app.get('/api/projects/{pid}/shots')
@@ -397,9 +439,22 @@ def create_app(db_path: str | Path | None = None, media_root: str | Path | None 
             shot = belong(c, 'shot', body.shot_id, pid)
             if shot['payload']['scene_id'] != clip['payload']['scene_id']:
                 raise DomainError('shot and clip must share scene')
-            c.map_shot(cid, body.shot_id, body.ordinal, body.shot_start, body.shot_end,
-                       body.clip_start, body.clip_end, body.cut_before)
-            return c.mappings(cid)
+            proposed = c.mappings(cid) + [{'clip_id': cid, **body.model_dump()}]
+            result = c.replace_mappings(cid, proposed, 'creator')
+            mark_impact(c, pid, 'shot_clip', cid, clip['payload']['scene_id'],
+                        'Shot 与 Clip 的时间映射已改变；最终制作方案需重新确认。', 'Must Replan / Rebuild')
+            return result
+        return execute(op)
+
+    @app.put('/api/projects/{pid}/clips/{cid}/mappings')
+    def replace_mappings(pid: str, cid: str, bodies: list[MappingInput], expected_revision: int):
+        def op(c):
+            clip = belong(c, 'clip', cid, pid)
+            result = c.replace_mappings(cid, [{'clip_id': cid, **b.model_dump()} for b in bodies],
+                                        'creator', expected_revision)
+            mark_impact(c, pid, 'shot_clip', cid, clip['payload']['scene_id'],
+                        'Shot 与 Clip 的时间映射已改变；最终制作方案需重新确认。', 'Must Replan / Rebuild')
+            return result
         return execute(op)
 
     @app.post('/api/projects/{pid}/clips/{cid}/dependencies/{upstream}')
@@ -420,6 +475,44 @@ def create_app(db_path: str | Path | None = None, media_root: str | Path | None 
             return [{**dict(r), 'payload': json.loads(r['payload'])} for r in op(c)]
         return execute(serialize)
 
+    @app.get('/api/projects/{pid}/clips/{cid}/references')
+    def references(pid: str, cid: str):
+        def op(c):
+            belong(c, 'clip', cid, pid)
+            try:
+                brief = c.get('brief', 'brief:' + cid)['payload']
+            except DomainError:
+                return []
+            return [c.get('reference_binding', rid) for rid in brief.get('references', [])]
+        return execute(op)
+
+    @app.post('/api/projects/{pid}/clips/{cid}/references')
+    def bind_reference(pid: str, cid: str, body: ReferenceInput):
+        def op(c):
+            belong(c, 'clip', cid, pid)
+            asset = c.get('asset_version', body.asset_id, body.asset_version)
+            if asset['payload'].get('project_id') != pid or body.role not in {
+                'character_identity', 'character_look', 'environment_identity', 'prop_identity',
+                'composition_reference', 'continuity_anchor', 'first_frame', 'last_frame'}:
+                raise DomainError('invalid reference source or role')
+            binding_id = uid('reference')
+            binding = c.put('reference_binding', binding_id, {'asset_id': body.asset_id,
+                'asset_version': body.asset_version, 'role': body.role, 'media_type': 'image',
+                'uri': asset['payload']['uri']}, 'creator-reference-plan')
+            brief = c.get('brief', 'brief:' + cid)
+            payload = {**brief['payload'], 'references': brief['payload'].get('references', []) + [binding_id]}
+            revised = c.save_brief(cid, payload, 'creator-reference-plan')
+            return {'binding': binding, 'brief': revised}
+        return execute(op)
+
+    @app.get('/api/projects/{pid}/control-media')
+    def control_media(pid: str):
+        def op(c):
+            ids = {t['id'] for t in c.db.execute('SELECT * FROM takes') if
+                   t['clip_id'] in {clip['id'] for clip in project_clips(c, pid)}}
+            return [m for m in latest(c, 'control_media') if m['payload'].get('source_take_id') in ids]
+        return execute(op)
+
     @app.post('/api/projects/{pid}/clips/{cid}/briefs')
     def save_brief(pid: str, cid: str, body: VersionedInput):
         def op(c):
@@ -438,6 +531,74 @@ def create_app(db_path: str | Path | None = None, media_root: str | Path | None 
             belong(c, 'clip', cid, pid)
             belong(c, 'clip', upstream, pid)
             return c.rebase_brief_state(cid, upstream)
+        return execute(op)
+
+    @app.post('/api/projects/{pid}/clips/{cid}/prepare-handoff')
+    def prepare_handoff(pid: str, cid: str, body: HandoffInput):
+        """Explicit human-reviewed continuity media; never promotes a Take to a master asset."""
+        def op(c):
+            belong(c, 'clip', cid, pid)
+            upstream = body.upstream_clip_id
+            belong(c, 'clip', upstream, pid)
+            dep = c.db.execute('SELECT kind FROM dependencies WHERE clip_id=? AND upstream_clip_id=?',
+                               (cid, upstream)).fetchone()
+            if not dep:
+                raise DomainError('declared upstream dependency missing')
+            selection = c.selection(upstream)
+            if not selection:
+                raise DomainError('wait for upstream Take selection')
+            c.next_clip_context(upstream)
+            take = c.take(selection['take_id'])
+            if take['test_only'] or not take['media_id']:
+                raise DomainError('real selected Take required for continuity media')
+            media = c.media(take['media_id'])
+            source = Path(media['local_path']).resolve()
+            if not source.is_file() or body.at_second < 0 or not body.assessment.strip():
+                raise DomainError('real media, valid timestamp and human assessment required')
+            if media['duration'] is not None and body.at_second >= media['duration']:
+                raise DomainError('timestamp exceeds source duration')
+            media_dir.mkdir(parents=True, exist_ok=True)
+            if body.kind == 'state':
+                return c.rebase_brief_state(cid, upstream)
+            if body.kind == 'stable_tail':
+                if dep['kind'] != 'VIDEO_CONTINUATION' or not 2 <= body.duration <= 15:
+                    raise DomainError('video continuation needs declared dependency and 2–15s tail')
+                if media['duration'] is not None and body.at_second + body.duration > media['duration']:
+                    raise DomainError('tail exceeds source duration')
+                dest = media_dir / (uid('stable-tail') + '.mp4')
+                subprocess.run(['ffmpeg', '-y', '-loglevel', 'error', '-ss', str(body.at_second), '-i', str(source),
+                                '-t', str(body.duration), '-c:v', 'libx264', '-crf', '18', '-an', str(dest)],
+                               check=True, timeout=120)
+                if not dest.is_file() or not dest.stat().st_size:
+                    raise DomainError('Stable Tail extraction failed')
+                control_id = uid('tail')
+                c.create_stable_tail(control_id, upstream, take['id'], str(dest),
+                                     {'stable': True, 'human_assessment': body.assessment})
+                payload = c.get('control_media', control_id)['payload']
+                c.put('control_media', control_id, {**payload, 'duration': body.duration,
+                      'source_selection_id': selection['id']}, 'human-reviewed-tail')
+                brief = c.rebase_brief_state(cid, upstream)
+                return {'control_media_id': control_id, 'brief': brief}
+            if body.kind == 'visual_anchor':
+                if dep['kind'] == 'VIDEO_CONTINUATION':
+                    raise DomainError('video continuation requires a Stable Tail')
+                dest = media_dir / (uid('visual-anchor') + '.png')
+                subprocess.run(['ffmpeg', '-y', '-loglevel', 'error', '-ss', str(body.at_second), '-i', str(source),
+                                '-frames:v', '1', str(dest)], check=True, timeout=120)
+                if not dest.is_file() or not dest.stat().st_size:
+                    raise DomainError('visual anchor extraction failed')
+                control_id, binding_id = uid('anchor'), uid('binding')
+                c.put('control_media', control_id, {'role': 'visual_anchor', 'source_take_id': take['id'],
+                    'source_selection_id': selection['id'], 'uri': str(dest),
+                    'assessment': body.assessment}, 'human-reviewed-frame')
+                c.put('reference_binding', binding_id, {'control_media_id': control_id,
+                    'role': 'continuity_anchor', 'media_type': 'image', 'uri': str(dest)}, 'production-plan')
+                current = c.get('brief', 'brief:' + cid)['payload']
+                c.save_brief(cid, {**current, 'references': list(dict.fromkeys(current.get('references', []) + [binding_id]))},
+                             'visual-anchor-plan')
+                brief = c.rebase_brief_state(cid, upstream)
+                return {'control_media_id': control_id, 'reference_binding_id': binding_id, 'brief': brief}
+            raise DomainError('invalid handoff kind')
         return execute(op)
 
     @app.get('/api/projects/{pid}/clips/{cid}/readiness')
@@ -465,7 +626,7 @@ def create_app(db_path: str | Path | None = None, media_root: str | Path | None 
         return execute(op)
 
     @app.post('/api/projects/{pid}/clips/{cid}/generate')
-    def generate(pid: str, cid: str):
+    def generate(pid: str, cid: str, retry_of: str | None = None):
         status = provider_status()['h3']
         if status != '可用':
             raise HTTPException(503, {'code': 'PROVIDER_UNAVAILABLE', 'message': provider_status()['h3_message']})
@@ -474,8 +635,10 @@ def create_app(db_path: str | Path | None = None, media_root: str | Path | None 
             previous = [c.job(r['id']) for r in c.db.execute('SELECT id FROM jobs WHERE task_id IN (SELECT id FROM compiled_tasks WHERE clip_id=?) ORDER BY created_at DESC', (cid,))]
             if any(j['status'] in {'queued', 'running'} for j in previous):
                 raise DomainError('a generation job is already active for this clip')
-            if previous and previous[0]['status'] == 'failed':
-                raise DomainError('previous failed job requires explicit review; no automatic retry')
+            if previous and previous[0]['status'] == 'failed' and retry_of != previous[0]['id']:
+                raise DomainError('previous failed job requires an explicit retry_of after review')
+            if retry_of and (not previous or previous[0]['id'] != retry_of or previous[0]['status'] != 'failed'):
+                raise DomainError('retry_of must name the latest failed Job for this Clip')
             profile_id = 'h3-darl'
             if not any(p['id'] == profile_id for p in latest(c, 'model_profile')):
                 c.put('model_profile', profile_id, darl_h3_profile(False), 'documented-profile', 'documented')
@@ -485,7 +648,9 @@ def create_app(db_path: str | Path | None = None, media_root: str | Path | None 
                 dep = c.db.execute("SELECT upstream_clip_id FROM dependencies WHERE clip_id=? AND kind='VIDEO_CONTINUATION'", (cid,)).fetchone()
                 if not dep:
                     raise DomainError('continuation dependency missing')
-                control = c.db.execute("SELECT id FROM objects WHERE kind='control_media' AND json_extract(payload,'$.role')='stable_tail' ORDER BY created_at DESC LIMIT 1").fetchone()
+                selected = c.selection(dep['upstream_clip_id'])
+                control = c.db.execute("SELECT id FROM objects WHERE kind='control_media' AND json_extract(payload,'$.role')='stable_tail' AND json_extract(payload,'$.source_take_id')=? ORDER BY created_at DESC LIMIT 1",
+                                       (selected['take_id'] if selected else '',)).fetchone()
                 if not control:
                     raise DomainError('selected upstream Stable Tail missing')
                 continuation = c.continuation_source(dep['upstream_clip_id'], control['id'])
@@ -496,7 +661,8 @@ def create_app(db_path: str | Path | None = None, media_root: str | Path | None 
                 raise DomainError('model preflight not ready: ' + json.dumps(c.preflight(task_id).reasons))
             adapter = DarlH3Adapter()
             adapter.build_request(task)
-            c.create_job(job_id, task_id, cost_estimate={'candidate_limit': 1, 'resolution': '480P'})
+            c.create_job(job_id, task_id, retry_of=retry_of,
+                         cost_estimate={'candidate_limit': 1, 'resolution': '480P'})
             try:
                 response = adapter.submit(task, job_id)
             except ProviderError as exc:
@@ -615,7 +781,7 @@ def create_app(db_path: str | Path | None = None, media_root: str | Path | None 
             if not selection or selection['take_id'] != body.take_id:
                 raise DomainError('timeline requires current selected Take')
             take = c.take(body.take_id)
-            if take['test_only'] or not take['media_id'] or not Path(take['media_uri']).is_file():
+            if (take['test_only'] and not c.test_mode) or not take['media_id'] or not Path(take['media_uri']).is_file():
                 raise DomainError('timeline requires real managed media')
             if body.trim_in < 0 or body.trim_out is not None and body.trim_out <= body.trim_in or not 0 <= body.volume <= 2:
                 raise DomainError('invalid timeline range or volume')
@@ -705,6 +871,13 @@ def scenes_for(core: Core, project_id: str) -> list[dict]:
 def project_world(core: Core, project_id: str, kind: str) -> list[dict]:
     """Include legacy #002 fixture identities referenced by this project's Briefs."""
     core.get('project', project_id)
+    if kind == 'asset_version':
+        selected = {(r['owner_id'], r['asset_id'], r['version']) for r in core.db.execute(
+            'SELECT owner_id,asset_id,version FROM asset_current WHERE project_id=?', (project_id,))}
+        return [{**dict(r), 'payload': json.loads(r['payload']),
+                 'is_current': (json.loads(r['payload']).get('owner_id'), r['id'], r['version']) in selected}
+                for r in core.db.execute("SELECT * FROM objects WHERE kind='asset_version' ORDER BY created_at DESC")
+                if json.loads(r['payload']).get('project_id') == project_id]
     visible = {x['id'] for x in latest(core, kind) if x['payload'].get('project_id') == project_id}
     clip_ids = {c['id'] for c in project_clips(core, project_id)}
     for brief in latest(core, 'brief'):
@@ -727,8 +900,8 @@ def clip_read(core: Core, clip: dict) -> dict:
     mappings = core.mappings(cid)
     dependencies = [dict(r) for r in core.db.execute('SELECT * FROM dependencies WHERE clip_id=?', (cid,))]
     selection = core.selection(cid)
-    return {**clip, 'mappings': mappings, 'dependencies': dependencies,
+    return {**clip, 'mappings': mappings, 'mapping_revision': core.mapping_revision(cid), 'dependencies': dependencies,
             'selection': selection, 'take_count': core.db.execute('SELECT COUNT(*) FROM takes WHERE clip_id=?', (cid,)).fetchone()[0]}
 
 
-app = create_app()
+app = create_app(test_mode=os.getenv('FILM_STUDIO_TEST_MODE') == '1')
