@@ -1,0 +1,17 @@
+执行 #001 — Production Core Foundation。
+
+正式规格文件：
+- docs/MASTER-BLUEPRINT.md
+- docs/PRODUCTION-RULES.md
+- docs/DECISIONS.md
+- docs/work-orders/001-production-core-foundation.md
+
+请先完整阅读以上文件，再扫描当前仓库并施工。
+
+规则：
+1. 新蓝图高于旧 v12 业务实现。
+2. 不要自行扩大范围。
+3. 不要自行进入 #002。
+4. 完成后按施工单要求提交 #001 施工报告和 commit，并停止等待验收。
+
+如果正式规格与现有代码冲突，不要自行折中；按规格实施，并把冲突与处理写进报告。
