@@ -8,3 +8,17 @@
 - `h3-unverified` Profile 的真实能力保持 unknown；真实任务需在 #002 前验证资料并建立新的 Profile 版本。
 
 权威规格位于 `docs/`，施工结论位于 `docs/reports/001-production-core-foundation-report.md`。
+
+## #002 H3 real vertical slice
+
+`scripts/h3_slice.py` is the explicit single-job runner for the Darl MiniMax-H3
+transport. It reads the bearer credential from stdin into the process only and
+does not store it. `prepare` creates `output/h3-002-2026-10-09/production.sqlite`;
+`models`, `submit --clip A --submit-one`, and `sync --job-id ...` handle the real
+task. Later `accept`, `anchor`, `tail`, and `preview` commands are gated by real
+Take, human Selection, and Canonical State. The `output/` folder is local managed
+media and is excluded from Git. Offline contract tests never make paid requests.
+
+The proxy's actual H3 route and limits are recorded separately from MiniMax's
+official public API. #002 remains incomplete until four real Takes and the
+human film review exist; see `docs/reports/002-h3-real-vertical-slice-report.md`.

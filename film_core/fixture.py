@@ -37,26 +37,31 @@ def test_profile():
     return p
 
 
-def seed(core: Core):
-    core.put("project", "station-film", {"title": "雨夜车站"}, "fixture")
+def seed(core: Core, production=False):
+    core.put("project", "station-film", {"title": "雨夜车站", "aspect_ratio": "16:9"}, "fixture")
     core.put("episode", "episode-1", {"project_id": "station-film", "number": 1}, "fixture")
     core.put("scene", "station-scene", {"episode_id": "episode-1", "place": "雨夜旧车站候车厅",
                                        "story": "林夏打开旧信，认出失踪多年的母亲的字迹；她没有哭，随后走向站台。"}, "fixture")
     core.put("character", "linxia", {"name": "林夏", "identity": "失踪母亲的女儿"}, "fixture")
-    core.put("character_look", "linxia-rain", {"character_id": "linxia", "description": "雨夜旅行装束"}, "fixture")
-    core.put("location", "old-station", {"identity": "旧车站候车厅与站台入口"}, "fixture")
+    look = ("约三十岁的中国女性，黑色齐颈短发，深灰旧风衣与浅色内搭，衣角有少量雨水，面容克制"
+            if production else "雨夜旅行装束")
+    core.put("character_look", "linxia-rain", {"character_id": "linxia", "description": look},
+             "derived-production-look" if production else "fixture")
+    core.put("location", "old-station", {"identity": "旧车站候车厅与站台入口；老式木长椅，湿润地面，冷色站台灯与暖色候车厅灯"},
+             "derived-production-world" if production else "fixture")
     core.put("prop", "old-letter", {"identity": "母亲留下的旧信"}, "fixture")
     core.put("story_fact", "mother-handwriting", {"fact": "林夏能认出母亲字迹", "scene_id": "station-scene"}, "fixture")
-    core.put("asset_version", "linxia-look-asset", {"owner_id": "linxia-rain", "media_type": "image",
-                                                   "uri": "fixture://reference/linxia.png"}, "fixture")
-    core.put("reference_binding", "linxia-reference", {"asset_id": "linxia-look-asset", "role": "character_look",
-                                                         "media_type": "image", "uri": "fixture://reference/linxia.png"}, "fixture")
+    if not production:
+        core.put("asset_version", "linxia-look-asset", {"owner_id": "linxia-rain", "media_type": "image",
+                                                       "uri": "fixture://reference/linxia.png"}, "fixture")
+        core.put("reference_binding", "linxia-reference", {"asset_id": "linxia-look-asset", "role": "character_look",
+                                                             "media_type": "image", "uri": "fixture://reference/linxia.png"}, "fixture")
     core.put("model_profile", "h3-unverified", H3_PROFILE_UNVERIFIED, "#001-unverified", "unverified")
     if core.test_mode:
         core.put("model_profile", "h3-test-contract", test_profile(), "synthetic-test", "test_only")
     shots = [
         ("S01", 3, "中近景，林夏坐着展开旧信"),
-        ("S02", 2, "信件特写，出现可识别字迹与署名"),
+        ("S02", 2, "信件特写，表现熟悉字迹与署名信息，不要求长篇准确可读文字"),
         ("S03", 5, "回人物，认出字迹，不哭，呼吸变浅，抬眼"),
         ("S04", 6, "CUT 到过肩侧后机位，望向列车灯"),
         ("S05", 20, "连续长镜头，折信、起身、穿过候车厅、停在站台门口"),
@@ -104,13 +109,15 @@ def seed(core: Core):
             "clip_id": cid, "scene_id": "station-scene", "purpose": "呈现林夏认出母亲字迹后克制的反应与赴站台的决定",
             "duration": duration, "shot_timeline": [{"shot_id": m["shot_id"], "start": m["clip_start"],
                 "end": m["clip_end"], "cut_before": bool(m["cut_before"]),
+                "shot_start": m["shot_start"], "shot_end": m["shot_end"],
                 "description": core.get("shot", m["shot_id"])["payload"]["description"]} for m in mapping],
             "subjects": [{"character_id": "linxia", "look_id": "linxia-rain"}],
-            "environment": {"location_id": "old-station", "rain": True, "time": "night"},
+            "environment": {"location_id": "old-station", "rain": True, "time": "night",
+                            "lighting": "候车厅暖光、站台冷光，窗外雨线可见" if production else "雨夜"},
             "props": [{"prop_id": "old-letter", "state": "held by Lin Xia"}],
             "state_in": initial, "action_process": [action],
             "performance": {"gaze": "由信纸缓慢转向站台", "breath": "变浅", "gesture": "手指压住纸边",
-                            "pause": "认出字迹后停顿", "reaction": "克制，不哭"},
+                            "pause": "认出字迹后停顿", "reaction": "克制，不哭，眼睛没有泪水"},
             "camera": {
                 "framing": {"A": "S01 中近景，S02 信纸特写，S03 回到人物中近景",
                             "B": "新机位：林夏侧后过肩，站台在视线方向",
@@ -121,7 +128,7 @@ def seed(core: Core):
                              "C1": "随林夏起身平稳跟拍，不切镜",
                              "C2": "沿 C1 的连续运动跟拍并稳定停住"}[cid]},
             "sound": {"diegetic": "雨声与远处列车声", "music": "无新增非叙事音乐"},
-            "references": ["linxia-reference"], "constraints": ["不改变导演 Shot 顺序"],
+            "references": [] if production else ["linxia-reference"], "constraints": ["不改变导演 Shot 顺序"],
             "locked_constraints": ["林夏没有哭", "不得新增关键剧情动作"],
             "planned_state_out": state_out, "handoff": handoff,
             "provenance": {"source": "fixture-director-plan", "authority": "LOCKED",

@@ -79,8 +79,13 @@ CREATE TABLE IF NOT EXISTS job_events (
 );
 CREATE TABLE IF NOT EXISTS takes (
   id TEXT PRIMARY KEY, clip_id TEXT NOT NULL, job_id TEXT NOT NULL REFERENCES jobs(id),
-  media_uri TEXT NOT NULL, provider_metadata TEXT NOT NULL, test_only INTEGER NOT NULL,
+  media_uri TEXT NOT NULL, media_id TEXT, provider_metadata TEXT NOT NULL, test_only INTEGER NOT NULL,
   created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS media_records (
+  id TEXT PRIMARY KEY, local_path TEXT NOT NULL, sha256 TEXT NOT NULL,
+  size_bytes INTEGER NOT NULL, mime TEXT NOT NULL, duration REAL,
+  metadata TEXT NOT NULL, created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS selections (
   id INTEGER PRIMARY KEY AUTOINCREMENT, clip_id TEXT NOT NULL, take_id TEXT NOT NULL REFERENCES takes(id),
@@ -254,7 +259,12 @@ class Core:
                 ref = self.get("reference_binding", ref_id)["payload"]
                 if not ref.get("role"):
                     reasons.append({"code": "REFERENCE_ROLE_MISSING", "field": ref_id})
-                self.get("asset_version", ref["asset_id"])
+                if ref.get("asset_id"):
+                    self.get("asset_version", ref["asset_id"])
+                elif ref.get("control_media_id"):
+                    self.get("control_media", ref["control_media_id"])
+                else:
+                    reasons.append({"code": "REFERENCE_SOURCE_MISSING", "field": ref_id})
             except DomainError:
                 reasons.append({"code": "REFERENCE_MISSING", "field": ref_id})
             except KeyError:
@@ -281,7 +291,7 @@ class Core:
         # Deterministic serialization: the compiler never authors new story facts.
         sections = {
             "subject_definitions": p["subjects"],
-            "summary": p["purpose"],
+            "summary": ("[video continuation] " if p["handoff"] == "VIDEO_CONTINUATION" else "") + p["purpose"],
             "retention_analysis": p.get("locked_constraints", []),
             "detailed_description": {k: p.get(k) for k in (
                 "shot_timeline", "environment", "props", "state_in", "action_process",
@@ -293,7 +303,20 @@ class Core:
             "purpose", "shot_timeline", "subjects", "environment", "props", "state_in",
             "action_process", "performance", "camera", "sound", "constraints",
             "locked_constraints", "planned_state_out", "handoff")}
-        prompt = "\n".join(k + ": " + encoded(v) for k, v in sections.items())
+        if not refs and not continuation:
+            sections = {
+                "integrated_multimodal_description": {
+                    "purpose": p["purpose"], "shot_timeline": p["shot_timeline"],
+                    "subjects": p["subjects"], "environment": p["environment"],
+                    "props": p.get("props"), "state_in": p["state_in"],
+                    "action_process": p["action_process"], "performance": p["performance"],
+                    "camera": p["camera"], "constraints": p.get("constraints"),
+                    "locked_constraints": p.get("locked_constraints"),
+                    "planned_state_out": p["planned_state_out"]},
+                "overall_soundscape": p["sound"],
+                "non_diegetic_music": p["sound"].get("music"),
+            }
+        prompt = self._render_h3_prompt(p, sections, refs, continuation)
         return {
             "id": task_id, "clip_id": p["clip_id"], "target_model": profile["payload"]["model_id"],
             "task_mode": p["handoff"], "compiled_prompt": prompt, "sections": sections,
@@ -308,7 +331,88 @@ class Core:
             "reference_versions": [ref["version"] for ref in ref_objects]
         }
 
-    def compile_h3(self, task_id, brief_id, profile_id, aspect_ratio="16:9", parameters=None,
+    def _render_h3_prompt(self, p, sections, refs, continuation):
+        """Deterministic text rendering from approved Brief fields; no story invention."""
+        location = self.get("location", p["environment"]["location_id"])["payload"]["identity"]
+        def visible_state(state):
+            facts = state.get("facts", state)
+            labels = {"letter_state": "信件状态", "prop_holder": "持信者", "position": "位置",
+                      "gaze": "视线", "orientation": "朝向", "emotion": "情绪余韵"}
+            parts = []
+            for key, value in facts.items():
+                if key in {"character_id", "look_id", "location_id"}:
+                    continue
+                if key == "crying":
+                    parts.append("哭泣" if value else "没有哭泣，眼睛无泪")
+                else:
+                    parts.append(labels.get(key, key) + "：" + str(value))
+            return "；".join(parts)
+        subject_lines = []
+        for subject in p["subjects"]:
+            person = self.get("character", subject["character_id"])["payload"]
+            look = self.get("character_look", subject["look_id"])["payload"]
+            subject_lines.append(person["name"] + " — " + look["description"])
+        prop_lines = []
+        for prop in p.get("props", []):
+            identity = self.get("prop", prop["prop_id"])["payload"]["identity"]
+            prop_lines.append(identity + " — " + str(prop.get("state", "")))
+        shot_lines = []
+        for index, shot in enumerate(p["shot_timeline"], 1):
+            cut = "CUT. " if shot.get("cut_before") else ""
+            source_range = ("; source Shot %.2f–%.2fs" % (shot["shot_start"], shot["shot_end"])
+                            if "shot_start" in shot and "shot_end" in shot else "")
+            shot_lines.append("[Shot %d | %.2f–%.2fs%s] %s%s" % (
+                index, shot["start"], shot["end"], source_range, cut, shot["description"]))
+        action_lines = [" → ".join(str(action[key]) for key in
+                        ("initial", "trigger", "development", "result"))
+                        for action in p["action_process"]]
+        detail = [
+            "Purpose: " + p["purpose"],
+            "Setting: " + location + "；" + "；".join(
+                ("窗外持续下雨" if value else "无雨") if key == "rain" else
+                ("夜晚" if value == "night" else str(value))
+                for key, value in p["environment"].items() if key != "location_id"),
+            "Subjects: " + "；".join(subject_lines),
+            "Props: " + "；".join(prop_lines),
+            "State in: " + visible_state(p["state_in"]),
+            *shot_lines,
+            "Action process: " + "；".join(action_lines),
+            "Observable performance: " + "；".join(str(value) for value in p["performance"].values()),
+            "Camera: " + "；".join(str(value) for value in p["camera"].values()),
+            "Constraints: " + "；".join(p.get("constraints", [])),
+            "Locked: " + "；".join(p.get("locked_constraints", [])),
+            "Planned state out: " + visible_state(p["planned_state_out"]),
+        ]
+        sound = str(p["sound"].get("diegetic", ""))
+        music = str(p["sound"].get("music", ""))
+        if "integrated_multimodal_description" in sections:
+            return ("integrated_multimodal_description:\n" + "\n".join(detail) +
+                    "\noverall_soundscape: " + sound + "\nnon_diegetic_music: " + music)
+        labels = []
+        picture = video = audio = 0
+        for ref in refs:
+            if ref["media_type"] == "image":
+                picture += 1
+                label = "<Picture %d>" % picture
+            elif ref["media_type"] == "video":
+                video += 1
+                label = "<Video %d>" % video
+            else:
+                audio += 1
+                label = "<Audio %d>" % audio
+            labels.append(label + " — " + ref["role"] + " from " + ref["id"])
+        if continuation:
+            video += 1
+            labels.append("<Video %d> — selected previous Clip Stable Tail; continuation source" % video)
+        summary = ("[video continuation] " if p["handoff"] == "VIDEO_CONTINUATION" else
+                   "[reference generation] ") + p["purpose"]
+        return ("subject_definitions:\n" + "\n".join(subject_lines + labels) +
+                "\nsummary: " + summary +
+                "\nretention_analysis: " + "；".join(p.get("locked_constraints", [])) +
+                "\ndetailed_description:\n" + "\n".join(detail) +
+                "\noverall_soundscape: " + sound + "\nnon_diegetic_music: " + music)
+
+    def compile_h3(self, task_id, brief_id, profile_id, aspect_ratio=None, parameters=None,
                    continuation=None, brief_version=None, profile_version=None):
         brief = self.get("brief", brief_id, brief_version)
         profile = self.get("model_profile", profile_id, profile_version)
@@ -319,11 +423,17 @@ class Core:
             raise DomainError("wrong model family")
         if self.db.execute("SELECT 1 FROM compiled_tasks WHERE id=?", (task_id,)).fetchone():
             raise DomainError("task id already exists")
+        scene = self.get("scene", brief["payload"]["scene_id"])["payload"]
+        episode = self.get("episode", scene["episode_id"])["payload"]
+        project_ratio = self.get("project", episode["project_id"])["payload"].get("aspect_ratio")
+        if not project_ratio or (aspect_ratio is not None and aspect_ratio != project_ratio):
+            raise DomainError("aspect ratio must come from Project decision")
+        aspect_ratio = project_ratio
         task = self._task_payload(brief, profile, task_id, aspect_ratio, parameters or {}, continuation)
         if digest(task["source_semantics"]) != task["semantic_hash"]:
             raise DomainError("compilation fidelity failure")
         for constraint in brief["payload"].get("locked_constraints", []):
-            if constraint not in task["sections"]["retention_analysis"]:
+            if constraint not in task["compiled_prompt"]:
                 raise DomainError("locked constraint lost")
         self.db.execute("INSERT INTO compiled_tasks VALUES (?,?,?,?,?,?,?,?,?)",
                         (task_id, task["clip_id"], brief["id"], brief["version"], profile["id"],
@@ -361,7 +471,7 @@ class Core:
         envelope = profile.get("duration_envelope")
         if not envelope or not envelope.get("verified"):
             fail("DURATION_UNVERIFIED", "duration")
-        elif not envelope["min"] <= task["duration"] <= envelope["max"]:
+        elif not isinstance(task["duration"], int) or not envelope["min"] <= task["duration"] <= envelope["max"]:
             fail("DURATION_OUT_OF_RANGE", "duration")
         media = profile.get("media_capability") or {}
         if not media.get("verified"):
@@ -372,14 +482,26 @@ class Core:
             for binding in task["media_bindings"]:
                 if binding.get("media_type") not in media.get("types", []):
                     fail("REFERENCE_TYPE_UNSUPPORTED", "media_bindings")
-                if not binding.get("role") or not binding.get("asset_id"):
+                if not binding.get("role") or not (binding.get("asset_id") or binding.get("control_media_id")):
                     fail("INVALID_REFERENCE_BINDING", "media_bindings")
                 try:
-                    asset = self.get("asset_version", binding["asset_id"])["payload"]
-                    if not binding.get("uri") and not asset.get("uri"):
+                    source = (self.get("asset_version", binding["asset_id"])["payload"]
+                              if binding.get("asset_id") else
+                              self.get("control_media", binding["control_media_id"])["payload"])
+                    if not binding.get("uri") and not source.get("uri"):
                         fail("MISSING_REFERENCE_MEDIA", binding["id"])
                 except DomainError:
                     fail("MISSING_REFERENCE_MEDIA", binding["id"])
+                if binding.get("control_media_id"):
+                    try:
+                        control = self.get("control_media", binding["control_media_id"])["payload"]
+                        source_take = self.take(control["source_take_id"])
+                        selected = self.selection(source_take["clip_id"])
+                        if (not selected or selected["take_id"] != source_take["id"] or
+                                selected["id"] != control.get("source_selection_id")):
+                            fail("STALE_VISUAL_ANCHOR", binding["id"])
+                    except (DomainError, KeyError):
+                        fail("INVALID_CONTROL_MEDIA", binding["id"])
         parameter_capability = profile.get("parameter_capability") or {}
         if not parameter_capability.get("verified"):
             fail("PARAMETERS_UNVERIFIED", "parameters")
@@ -393,7 +515,10 @@ class Core:
                     fail("REQUIRED_PARAMETER_MISSING", key)
         if task["aspect_ratio"] not in profile.get("aspect_ratios", []):
             fail("ASPECT_RATIO_UNVERIFIED_OR_UNSUPPORTED", "aspect_ratio")
-        for required in profile.get("compilation_requirements", {}).get("required_sections", []):
+        required_sections = (profile.get("compilation_requirements", {}).get("base_sections", [])
+                             if not task["media_bindings"] and not task["continuation"] else
+                             profile.get("compilation_requirements", {}).get("required_sections", []))
+        for required in required_sections:
             if required not in task["sections"] or task["sections"][required] is None:
                 fail("COMPILED_SECTION_MISSING", required)
         if task["source_semantics"].get("sound"):
@@ -445,14 +570,14 @@ class Core:
                 fail("UNEXPECTED_CONTINUATION", "continuation")
         return QAResult("READY" if not reasons else "NOT_READY", tuple(reasons))
 
-    def create_job(self, job_id, task_id, retry_of=None):
+    def create_job(self, job_id, task_id, retry_of=None, cost_estimate=None):
         result = self.preflight(task_id)
         if not result.ready:
             raise DomainError("preflight failed: " + encoded(result.reasons))
         task = self.task(task_id)
         if retry_of:
             self.job(retry_of)
-        snapshot = {"task": task, "retry_of": retry_of}
+        snapshot = {"task": task, "retry_of": retry_of, "cost_estimate": cost_estimate}
         self.db.execute("INSERT INTO jobs VALUES (?,?,?,?)", (job_id, task_id, encoded(snapshot), now()))
         self.db.execute("INSERT INTO job_events(job_id,status,metadata,created_at) VALUES (?,?,?,?)",
                         (job_id, "queued", "{}", now()))
@@ -480,15 +605,37 @@ class Core:
         self.db.commit()
         return self.job(job_id)
 
-    def record_take(self, take_id, job_id, media_uri, provider_metadata=None, test_only=False):
+    def register_media(self, media_id, local_path, sha256, size_bytes, mime, duration=None, metadata=None):
+        from pathlib import Path
+        path = Path(local_path)
+        if not path.is_file() or not sha256 or size_bytes <= 0 or not mime:
+            raise DomainError("managed media must exist with integrity metadata")
+        if path.stat().st_size != size_bytes or hashlib.sha256(path.read_bytes()).hexdigest() != sha256:
+            raise DomainError("managed media size or checksum mismatch")
+        self.db.execute("INSERT INTO media_records VALUES (?,?,?,?,?,?,?,?)",
+                        (media_id, local_path, sha256, size_bytes, mime, duration,
+                         encoded(metadata or {}), now()))
+        self.db.commit()
+
+    def media(self, media_id):
+        row = self.db.execute("SELECT * FROM media_records WHERE id=?", (media_id,)).fetchone()
+        if not row:
+            raise DomainError("media record missing")
+        result = dict(row)
+        result["metadata"] = json.loads(result["metadata"])
+        return result
+
+    def record_take(self, take_id, job_id, media_uri, provider_metadata=None, test_only=False, media_id=None):
         job = self.job(job_id)
         if job["status"] != "succeeded" or not media_uri:
             raise DomainError("take requires succeeded job and media")
         if test_only and not self.test_mode:
             raise DomainError("test take forbidden outside test mode")
+        if not test_only and (not media_id or self.media(media_id)["local_path"] != media_uri):
+            raise DomainError("real take requires managed media record")
         clip_id = job["snapshot"]["task"]["clip_id"]
-        self.db.execute("INSERT INTO takes VALUES (?,?,?,?,?,?,?)",
-                        (take_id, clip_id, job_id, media_uri, encoded(provider_metadata or {}),
+        self.db.execute("INSERT INTO takes VALUES (?,?,?,?,?,?,?,?)",
+                        (take_id, clip_id, job_id, media_uri, media_id, encoded(provider_metadata or {}),
                          int(test_only), now()))
         self.db.commit()
         return self.take(take_id)
@@ -563,7 +710,7 @@ class Core:
     def impact(self, task_id):
         result = self.preflight(task_id)
         codes = {r["code"] for r in result.reasons}
-        if codes.intersection({"STALE_UPSTREAM_SELECTION", "BRIEF_VERSION_STALE"}):
+        if codes.intersection({"STALE_UPSTREAM_SELECTION", "STALE_VISUAL_ANCHOR", "BRIEF_VERSION_STALE"}):
             return "Must Replan / Rebuild"
         if result.ready:
             return "Still Valid"
