@@ -11,6 +11,8 @@ from fastapi.testclient import TestClient
 from apps.api.main import create_app
 from film_core import Core
 from film_core.fixture import seed
+from film_core.darl_h3 import ProviderError
+from film_core.h3_profile import darl_h3_profile
 
 
 class CreatorApiTests(unittest.TestCase):
@@ -99,6 +101,25 @@ class CreatorApiTests(unittest.TestCase):
         self.assertEqual(blocked.status_code, 503)
         self.assertEqual(len(self.client.get('/api/projects/station-film/jobs').json()), 1)
 
+    def test_generate_compiles_brief_and_surfaces_provider_failure(self):
+        self.fixture()
+        core = self.core()
+        core.put('model_profile', 'h3-darl', darl_h3_profile(False), 'test-documented', 'documented')
+        core.close()
+        with patch.dict(os.environ, {'DARL_API_KEY': 'TEST-ONLY', 'H3_SERVER_ON': '1'}), \
+             patch('apps.api.main.DarlH3Adapter') as adapter:
+            adapter.return_value.build_request.return_value = {'model': 'MiniMax-H3'}
+            adapter.return_value.submit.side_effect = ProviderError('fail_to_fetch_task',
+                                                                     'upstream offline', http_status=404)
+            response = self.client.post('/api/projects/station-film/clips/A/generate')
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()['detail']['code'], 'PROVIDER_UNAVAILABLE')
+        jobs = self.client.get('/api/projects/station-film/jobs').json()
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]['status'], 'failed')
+        self.assertEqual(jobs[0]['snapshot']['task']['source_brief']['id'], 'brief:A')
+        self.assertEqual(self.client.get('/api/projects/station-film/clips/A/briefs').json()[0]['version'], 1)
+
     def test_valid_take_selection_observation_confirmation_and_timeline(self):
         self.fixture()
         core = self.core()
@@ -127,6 +148,17 @@ class CreatorApiTests(unittest.TestCase):
         self.assertEqual(added.status_code, 200)
         iid = added.json()['id']
         self.assertEqual(self.client.patch(f'/api/projects/station-film/timeline/items/{iid}', json={'trim_in': 1}).status_code, 200)
+        core = self.core()
+        core.record_take('take-test-second', 'job-test', str(media_file), test_only=True, media_id='media-test')
+        core.close()
+        self.assertEqual(self.client.patch(f'/api/projects/station-film/timeline/items/{iid}',
+                                           json={'take_id': 'take-test-second'}).status_code, 400)
+        self.client.post('/api/projects/station-film/clips/A/selection',
+                         json={'take_id': 'take-test-second', 'actor': 'tester'})
+        replacement = self.client.patch(f'/api/projects/station-film/timeline/items/{iid}',
+                                        json={'take_id': 'take-test-second'})
+        self.assertEqual(replacement.status_code, 200)
+        self.assertEqual(replacement.json()['take_id'], 'take-test-second')
         self.assertEqual(len(self.client.get('/api/projects/station-film/timeline').json()['items']), 1)
         core = self.core()
         self.assertEqual(core.take('take-test')['media_uri'], str(media_file))
@@ -139,6 +171,9 @@ class CreatorApiTests(unittest.TestCase):
         bad = self.client.post('/api/projects/station-film/assets/upload?owner_id=linxia&purpose=look',
                                files={'file': ('fake.png', b'not an image', 'image/png')})
         self.assertEqual(bad.status_code, 415)
+        mismatch = self.client.post('/api/projects/station-film/assets/upload?owner_id=linxia&purpose=look',
+                                    files={'file': ('wrong.jpg', b'\x89PNG\r\n\x1a\n' + b'data', 'image/jpeg')})
+        self.assertEqual(mismatch.status_code, 415)
         valid = self.client.post('/api/projects/station-film/assets/upload?owner_id=linxia&purpose=look',
                                  files={'file': ('real.png', b'\x89PNG\r\n\x1a\n' + b'data', 'image/png')})
         self.assertEqual(valid.status_code, 200)
@@ -153,6 +188,46 @@ class CreatorApiTests(unittest.TestCase):
         versions = self.client.get('/api/projects/station-film/world/asset_version').json()
         self.assertEqual(len(versions), 2)
         self.assertEqual(next(v['version'] for v in versions if v['is_current']), 1)
+        bound = self.client.post('/api/projects/station-film/clips/A/references', json={
+            'asset_id': asset['id'], 'asset_version': 1, 'role': 'character_identity'})
+        self.assertEqual(bound.status_code, 200)
+        self.assertEqual(bound.json()['brief']['version'], 2)
+        self.assertEqual(self.client.get('/api/projects/station-film/clips/A/references').json()[0]['payload']['role'], 'character_identity')
+        prep = self.client.get('/api/projects/station-film/visual-prep')
+        self.assertEqual(prep.status_code, 200)
+        self.assertIsInstance(prep.json()[0]['missing_visual_anchors'], list)
+
+    def test_c1_selection_change_marks_c2_continuation_stale(self):
+        self.fixture()
+        core = self.core()
+        facts = core.get('brief', 'brief:A')['payload']['state_in']['facts']
+        for clip, upstream in [('A', None), ('B', 'A'), ('C1', 'B')]:
+            if upstream:
+                core.rebase_brief_state(clip, upstream)
+            task_id, job_id, take_id = 'task-' + clip, 'job-' + clip, 'take-' + clip
+            core.compile_h3(task_id, 'brief:' + clip, 'h3-test-contract')
+            core.create_job(job_id, task_id)
+            core.job_event(job_id, 'running')
+            core.job_event(job_id, 'succeeded')
+            core.record_take(take_id, job_id, 'test-only://' + clip, test_only=True)
+            core.select_take(clip, take_id, 'tester')
+            core.observe('observed-' + clip, take_id, facts, 'tester')
+            core.confirm_state(clip, 'observed-' + clip, 'tester')
+        core.record_take('take-C1-alt', 'job-C1', 'test-only://C1-alt', test_only=True)
+        core.rebase_brief_state('C2', 'C1')
+        core.create_stable_tail('tail-C1-test', 'C1', 'take-C1', 'test-only://tail', {'stable': True})
+        continuation = core.continuation_source('C1', 'tail-C1-test')
+        core.compile_h3('task-C2', 'brief:C2', 'h3-test-contract', continuation=continuation)
+        self.assertEqual(core.preflight('task-C2').status, 'READY')
+        core.close()
+        changed = self.client.post('/api/projects/station-film/clips/C1/selection',
+                                   json={'take_id': 'take-C1-alt', 'actor': 'tester'})
+        self.assertEqual(changed.status_code, 200)
+        core = self.core()
+        self.assertEqual(core.impact('task-C2'), 'Must Replan / Rebuild')
+        core.close()
+        impacts = self.client.get('/api/projects/station-film/impacts').json()
+        self.assertTrue(any(x['clip_id'] == 'C2' and '上游采用版本' in x['message'] for x in impacts))
 
 
 if __name__ == '__main__':

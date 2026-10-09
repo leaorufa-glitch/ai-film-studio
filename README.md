@@ -1,24 +1,37 @@
-# AI Film Studio — Production Core Foundation (#001)
+# AI Film Studio
 
-独立的新项目。这里只实现 #001 的生产内核，不包含 Creator UI 或真实 H3 调用。
+Architecture Reset 后的独立创作者网站。`film_core/` 保存 #001/#002 的正式 Project、Shot、Clip、Brief、Task、Job、Take 与影片状态；`apps/api/` 是 FastAPI 包装层；`apps/web/` 是 Next.js + TypeScript 六个工作区。项目媒体与本地数据库保存在 Git 忽略的 `output/`。
 
-- Python 3.9+，仅标准库；SQLite 持久化。
-- `python3 -m unittest discover -s tests -v` 运行合同测试。
-- `film_core.fixture.seed` 建立雨夜车站的规划数据；测试中的 provider URI 是显式的 `test_only` 模拟结果，不能用于生产验收。
-- `h3-unverified` Profile 的真实能力保持 unknown；真实任务需在 #002 前验证资料并建立新的 Profile 版本。
+## 本地启动
 
-权威规格位于 `docs/`，施工结论位于 `docs/reports/001-production-core-foundation-report.md`。
+要求 Python 3.9+、Node.js 20+、npm。导出预览还需要 `ffmpeg`。
 
-## #002 H3 real vertical slice
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r apps/api/requirements.txt
+npm ci --prefix apps/web
+.venv/bin/uvicorn apps.api.main:app --host 127.0.0.1 --port 8000
+```
 
-`scripts/h3_slice.py` is the explicit single-job runner for the Darl MiniMax-H3
-transport. It reads the bearer credential from stdin into the process only and
-does not store it. `prepare` creates `output/h3-002-2026-10-09/production.sqlite`;
-`models`, `submit --clip A --submit-one`, and `sync --job-id ...` handle the real
-task. Later `accept`, `anchor`, `tail`, and `preview` commands are gated by real
-Take, human Selection, and Canonical State. The `output/` folder is local managed
-media and is excluded from Git. Offline contract tests never make paid requests.
+另开终端，在项目根目录执行：
 
-The proxy's actual H3 route and limits are recorded separately from MiniMax's
-official public API. #002 remains incomplete until four real Takes and the
-human film review exist; see `docs/reports/002-h3-real-vertical-slice-report.md`.
+```bash
+npm run dev --prefix apps/web
+```
+
+网站：<http://127.0.0.1:3000>；API 健康检查：<http://127.0.0.1:8000/api/health>。默认读取保留下来的 #002 雨夜车站数据库 `output/h3-002-2026-10-09/production.sqlite`；可用 `FILM_STUDIO_DB=/absolute/path/studio.sqlite` 指向另一份本地数据库，`FILM_STUDIO_MEDIA` 指定受管媒体目录。前端只通过 API 读写正式对象。空数据库可以从 Home 创建影片。
+
+H3 服务器关机是正常状态，04 会显示“服务未启动”，创作规划可继续。服务器真正开机后，服务端设置 `H3_SERVER_ON=1` 与 `DARL_API_KEY`，再重启 API；凭证不得写入前端环境变量或提交到 Git。生成按钮只提交一次明确的 Job，任务查询通过页面手动同步，不会自动轮询或重试。#002 的真实 A→B→C1→C2 影片验收仍待服务器开启和人工审片。用户偏好默认为 16:9、480P、20 步。
+
+## 验证
+
+```bash
+.venv/bin/python -m unittest discover -s tests -v
+python3 -m compileall -q film_core apps/api scripts tests
+npm run build --prefix apps/web
+npm run test:e2e --prefix apps/web
+```
+
+E2E 使用独立的 `output/e2e/` 数据库和明确标记 `TEST ONLY` 的候选结果。它不调用真实 H3，也不写入 #002 的真实执行数据库。浏览器测试使用本机 Chrome；若尚未安装，可执行 `npx playwright install chromium`。
+
+施工规格与验收记录见 `docs/MASTER-BLUEPRINT.md`、`docs/PRODUCTION-RULES.md`、`docs/DECISIONS.md` 和 `docs/reports/`。

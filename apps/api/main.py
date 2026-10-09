@@ -66,6 +66,8 @@ def belong(core: Core, kind: str, object_id: str, project_id: str) -> dict:
         owner = project_id
     else:
         owner = p.get('project_id')
+        if owner is None and kind in {'character', 'character_look', 'location', 'prop'}:
+            owner = project_id if any(x['id'] == object_id for x in project_world(core, project_id, kind)) else None
     if owner != project_id:
         raise DomainError('object does not belong to project')
     return item
@@ -157,6 +159,7 @@ class TimelineInput(BaseModel):
 
 class TimelinePatch(BaseModel):
     position: int | None = None
+    take_id: str | None = None
     trim_in: float | None = None
     trim_out: float | None = None
     transition: str | None = None
@@ -333,7 +336,12 @@ def create_app(db_path: str | Path | None = None, media_root: str | Path | None 
         content = await file.read(10 * 1024 * 1024 + 1)
         if len(content) > 10 * 1024 * 1024 or not content:
             raise HTTPException(413, 'image must be 1 byte to 10 MB')
-        if not (content.startswith(b'\x89PNG\r\n\x1a\n') or content.startswith(b'\xff\xd8\xff') or content.startswith(b'RIFF') and content[8:12] == b'WEBP'):
+        signatures = {
+            'image/png': content.startswith(b'\x89PNG\r\n\x1a\n'),
+            'image/jpeg': content.startswith(b'\xff\xd8\xff'),
+            'image/webp': content.startswith(b'RIFF') and content[8:12] == b'WEBP',
+        }
+        if not signatures[file.content_type]:
             raise HTTPException(415, 'file signature does not match image type')
         def op(c):
             c.get('project', pid)
@@ -375,6 +383,34 @@ def create_app(db_path: str | Path | None = None, media_root: str | Path | None 
             mark_impact(c, pid, 'asset_current', aid, None,
                         '当前视觉版本已切换；相关后续片段需要检查连续性。')
             return {'owner_id': p['owner_id'], 'asset_id': aid, 'version': body.version}
+        return execute(op)
+
+    @app.get('/api/projects/{pid}/visual-prep')
+    def visual_prep(pid: str):
+        def op(c):
+            current_owners = {r['owner_id'] for r in c.db.execute('SELECT owner_id FROM asset_current WHERE project_id=?', (pid,))}
+            result = []
+            for scene in scenes_for(c, pid):
+                missing = []
+                for clip in project_clips(c, pid):
+                    if clip['payload']['scene_id'] != scene['id']:
+                        continue
+                    try:
+                        brief = c.get('brief', 'brief:' + clip['id'])['payload']
+                    except DomainError:
+                        continue
+                    for subject in brief.get('subjects', []):
+                        for kind, key in [('character', 'character_id'), ('character_look', 'look_id')]:
+                            oid = subject.get(key)
+                            if oid and oid not in current_owners:
+                                item = c.get(kind, oid)['payload']
+                                missing.append(item.get('name') or item.get('description') or oid)
+                    location_id = brief.get('environment', {}).get('location_id')
+                    if location_id and location_id not in current_owners:
+                        missing.append(c.get('location', location_id)['payload'].get('identity', location_id))
+                result.append({'scene_id': scene['id'], 'scene': scene['payload'].get('place', ''),
+                               'missing_visual_anchors': list(dict.fromkeys(missing))})
+            return result
         return execute(op)
 
     @app.get('/api/projects/{pid}/shots')
@@ -625,6 +661,24 @@ def create_app(db_path: str | Path | None = None, media_root: str | Path | None 
             return result
         return execute(op)
 
+    @app.get('/api/projects/{pid}/jobs/{jid}')
+    def job_detail(pid: str, jid: str):
+        def op(c):
+            job = c.job(jid)
+            belong(c, 'clip', job['snapshot']['task']['clip_id'], pid)
+            return {**job, 'events': [{**dict(r), 'metadata': json.loads(r['metadata'])}
+                    for r in c.db.execute('SELECT * FROM job_events WHERE job_id=? ORDER BY id', (jid,))]}
+        return execute(op)
+
+    @app.get('/api/projects/{pid}/compiled-tasks')
+    def compiled_tasks(pid: str, clip_id: str | None = None):
+        def op(c):
+            ids = {x['id'] for x in project_clips(c, pid)}
+            return [{**dict(r), 'payload': json.loads(r['payload'])} for r in c.db.execute(
+                'SELECT * FROM compiled_tasks ORDER BY created_at DESC')
+                if r['clip_id'] in ids and (clip_id is None or r['clip_id'] == clip_id)]
+        return execute(op)
+
     @app.post('/api/projects/{pid}/clips/{cid}/generate')
     def generate(pid: str, cid: str, retry_of: str | None = None):
         status = provider_status()['h3']
@@ -742,9 +796,26 @@ def create_app(db_path: str | Path | None = None, media_root: str | Path | None 
             return {'id': oid, 'take_id': body.take_id, 'state': body.state}
         return execute(op)
 
+    @app.get('/api/projects/{pid}/clips/{cid}/observed')
+    def observed_history(pid: str, cid: str):
+        def op(c):
+            belong(c, 'clip', cid, pid)
+            return [{**dict(r), 'payload': json.loads(r['payload'])}
+                    for r in c.db.execute('SELECT o.* FROM observed_states o JOIN takes t ON t.id=o.take_id '
+                                          'WHERE t.clip_id=? ORDER BY o.created_at DESC', (cid,))]
+        return execute(op)
+
     @app.post('/api/projects/{pid}/clips/{cid}/canonical/{oid}')
     def canonical(pid: str, cid: str, oid: str, actor: str = 'local-creator'):
         return execute(lambda c: (belong(c, 'clip', cid, pid), c.confirm_state(cid, oid, actor))[1])
+
+    @app.get('/api/projects/{pid}/clips/{cid}/canonical')
+    def canonical_history(pid: str, cid: str):
+        def op(c):
+            belong(c, 'clip', cid, pid)
+            return [{**dict(r), 'payload': json.loads(r['payload'])}
+                    for r in c.db.execute('SELECT * FROM state_snapshots WHERE clip_id=? ORDER BY id DESC', (cid,))]
+        return execute(op)
 
     @app.get('/api/projects/{pid}/reality')
     def reality(pid: str):
@@ -783,7 +854,7 @@ def create_app(db_path: str | Path | None = None, media_root: str | Path | None 
             take = c.take(body.take_id)
             if (take['test_only'] and not c.test_mode) or not take['media_id'] or not Path(take['media_uri']).is_file():
                 raise DomainError('timeline requires real managed media')
-            if body.trim_in < 0 or body.trim_out is not None and body.trim_out <= body.trim_in or not 0 <= body.volume <= 2:
+            if body.trim_in < 0 or body.trim_out is not None and body.trim_out <= body.trim_in or not 0 <= body.volume <= 2 or body.transition not in {'cut', 'fade'}:
                 raise DomainError('invalid timeline range or volume')
             pos = c.db.execute('SELECT COALESCE(MAX(position),-1)+1 FROM timeline_items WHERE project_id=?', (pid,)).fetchone()[0]
             item_id = uid('timeline')
@@ -800,10 +871,15 @@ def create_app(db_path: str | Path | None = None, media_root: str | Path | None 
             if not row:
                 raise DomainError('timeline item missing')
             values = {**dict(row), **body.model_dump(exclude_none=True)}
-            if values['trim_in'] < 0 or values['trim_out'] is not None and values['trim_out'] <= values['trim_in'] or not 0 <= values['volume'] <= 2:
+            if values['take_id'] != row['take_id']:
+                selection = c.selection(row['clip_id'])
+                take = c.take(values['take_id'])
+                if not selection or selection['take_id'] != values['take_id'] or (take['test_only'] and not c.test_mode) or not take['media_id'] or not Path(take['media_uri']).is_file():
+                    raise DomainError('timeline replacement requires current selected managed Take')
+            if values['trim_in'] < 0 or values['trim_out'] is not None and values['trim_out'] <= values['trim_in'] or not 0 <= values['volume'] <= 2 or values['transition'] not in {'cut', 'fade'}:
                 raise DomainError('invalid timeline range or volume')
-            c.db.execute('UPDATE timeline_items SET position=?,trim_in=?,trim_out=?,transition=?,volume=? WHERE id=?',
-                         (values['position'], values['trim_in'], values['trim_out'], values['transition'], values['volume'], iid))
+            c.db.execute('UPDATE timeline_items SET position=?,take_id=?,trim_in=?,trim_out=?,transition=?,volume=? WHERE id=?',
+                         (values['position'], values['take_id'], values['trim_in'], values['trim_out'], values['transition'], values['volume'], iid))
             c.db.commit()
             return dict(c.db.execute('SELECT * FROM timeline_items WHERE id=?', (iid,)).fetchone())
         return execute(op)
@@ -849,6 +925,8 @@ def create_app(db_path: str | Path | None = None, media_root: str | Path | None 
                 args = ['ffmpeg', '-y', '-loglevel', 'error', '-ss', str(row['trim_in']), '-i', str(src)]
                 if row['trim_out'] is not None:
                     args += ['-t', str(row['trim_out'] - row['trim_in'])]
+                if row['transition'] == 'fade':
+                    args += ['-vf', 'fade=t=in:st=0:d=0.25']
                 args += ['-filter:a', f"volume={row['volume']}", '-c:v', 'libx264', '-c:a', 'aac', str(target)]
                 subprocess.run(args, check=True, timeout=180)
                 segments.append(target)
@@ -857,7 +935,22 @@ def create_app(db_path: str | Path | None = None, media_root: str | Path | None 
             target = media_dir / (uid('preview') + '.mp4')
             subprocess.run(['ffmpeg', '-y', '-loglevel', 'error', '-f', 'concat', '-safe', '0', '-i', str(manifest),
                             '-c', 'copy', str(target)], check=True, timeout=180)
-            return {'path': str(target), 'status': 'ready'}
+            subtitles = [dict(r) for r in c.db.execute(
+                'SELECT * FROM timeline_subtitles WHERE project_id=? ORDER BY start', (pid,))]
+            subtitle_path = None
+            if subtitles:
+                def stamp(seconds):
+                    milliseconds = round(seconds * 1000)
+                    hours, rem = divmod(milliseconds, 3600000)
+                    minutes, rem = divmod(rem, 60000)
+                    whole, milli = divmod(rem, 1000)
+                    return f'{hours:02}:{minutes:02}:{whole:02},{milli:03}'
+                subtitle_path = target.with_suffix('.srt')
+                subtitle_path.write_text(''.join(
+                    f"{i}\n{stamp(s['start'])} --> {stamp(s['end'])}\n{s['text']}\n\n"
+                    for i, s in enumerate(subtitles, 1)), encoding='utf-8')
+            return {'path': str(target), 'subtitle_path': str(subtitle_path) if subtitle_path else None,
+                    'status': 'ready'}
         return execute(op)
 
     return app

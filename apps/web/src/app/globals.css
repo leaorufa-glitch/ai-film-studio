@@ -17,3 +17,6 @@
 .mobile-menu{display:none;background:transparent;color:var(--text);border:0;margin-right:12px}
 .handoff-box{background:#202926;border:1px solid #45574c;border-radius:10px;padding:17px;margin-top:12px}.handoff-box .mapping-form{border-top:0;padding-top:0}.handoff-box .mapping-form input{width:160px}.handoff-box .mapping-form select{width:175px}
 .reference-plan{border-top:1px solid var(--border);padding-top:14px;margin-top:14px}.reference-plan .mapping-form{border-top:0;padding-top:0}.reference-plan .mapping-form select{width:185px}
+.visual-prep{display:flex;align-items:flex-start;gap:11px;padding:14px;background:#29352f;border:1px solid #455f4e;border-radius:10px;margin-bottom:18px;color:#b3d0b8}.visual-prep div{display:flex;flex-direction:column;gap:4px}.visual-prep span{font-size:12px;color:#a9baae}
+.state-diff{margin:12px 0;padding:11px 12px;border-left:2px solid var(--gold);background:#2a302d;border-radius:4px}.state-diff span{font-size:10px;color:var(--gold-light);font-weight:700}.state-diff p{font-size:12px;line-height:1.5;margin:6px 0 0;color:var(--text)}
+.final-track-panel:empty{display:none}.final-layout:has(.final-track-panel:empty){grid-template-columns:minmax(0,1fr)}
