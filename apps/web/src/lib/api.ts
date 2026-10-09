@@ -1,7 +1,17 @@
 export const API = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000';
 export type Entity = { id: string; kind: string; version: number; status: string; payload: Record<string, any>; created_at: string; is_current?: boolean };
 export type Clip = Entity & { mappings: any[]; mapping_revision: number; dependencies: any[]; selection: any | null; take_count: number };
-export type Provider = { llm: string; image: string; h3: string; h3_message: string; runninghub_h3?: string };
+export type Provider = { llm: string; image: string; h3: string; h3_message: string; provider: 'darl'; execution_model: string; execution_route: string; self_hosted_h3: string; cloud_h3: string };
+
+export function executionRoute(model?: string): string {
+  return model === 'MiniMax-H3' ? '自建 H3' : model === 'runninghub-minimax-h3' ? '云端 H3 · 备用' : 'H3 执行路线待确认';
+}
+
+export function isDarlJob(job: any): boolean {
+  const task = job?.snapshot?.task;
+  return ['h3-darl', 'h3-darl-cloud'].includes(task?.model_profile?.id) &&
+    [job?.metadata?.provider, task?.provider, job?.snapshot?.cost_estimate?.provider].every(value => !value || value === 'darl');
+}
 
 export async function request<T = any>(path: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(`${API}/api${path}`, {

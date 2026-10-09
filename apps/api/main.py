@@ -18,11 +18,10 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from film_core import Core, DomainError
-from film_core.darl_h3 import DarlH3Adapter, ProviderError
-from film_core.h3_profile import darl_h3_profile
+from film_core.darl_h3 import DarlH3Adapter, ProviderError, darl_execution_model
+from film_core.h3_profile import LOCAL_H3_MODEL, H3_EXECUTION_MODELS, H3_PROFILE_IDS, current_h3_execution_model, darl_h3_profile
 from .ai_providers import AIProviderError, DarlImageAdapter, DarlLLMAdapter
-from .job_runtime import JobWorker, utcnow
-from .runninghub_h3 import RunningHubH3Adapter, runninghub_h3_profile
+from .job_runtime import JobWorker, generation_provider, utcnow
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DB = ROOT / 'output' / 'h3-002-2026-10-09' / 'production.sqlite'
@@ -128,31 +127,18 @@ def mark_impact(core: Core, project_id: str, source_kind: str, source_id: str,
     core.db.commit()
 
 
-def generation_provider(job: dict) -> str:
-    providers = {provider for provider in (
-        job['metadata'].get('provider'),
-        (job['snapshot'].get('cost_estimate') or {}).get('provider')) if provider}
-    profile_provider = {'h3-darl': 'darl', 'h3-runninghub': 'runninghub'}.get(
-        job['snapshot']['task'].get('model_profile', {}).get('id'))
-    if profile_provider:
-        providers.add(profile_provider)
-    if len(providers) > 1 or providers - {'darl', 'runninghub'}:
-        raise DomainError('original Job Provider is inconsistent or unsupported')
-    if not providers:
-        raise DomainError('original Job Provider unavailable; use Creative Regenerate')
-    return next(iter(providers))
-
-
 def provider_status() -> dict:
     key = os.getenv('DARL_API_KEY')
-    video = '服务未启动' if os.getenv('H3_SERVER_ON') != '1' else ('可用' if key else '未配置')
-    fallback = '可用' if os.getenv('RUNNINGHUB_API_KEY') and (os.getenv('RUNNINGHUB_WEBAPP_ID') or '').isdigit() else '未配置'
+    self_hosted = os.getenv('H3_SERVER_ON') == '1'
+    execution_model = current_h3_execution_model()
     return {'llm': '未配置' if not (os.getenv('LLM_API_KEY') or key) else '可用',
             'image': '未配置' if not (os.getenv('IMAGE_API_KEY') or key) else '可用',
-            'h3': video, 'runninghub_h3': fallback,
-            'h3_message': ('本地 H3 未启动，可使用备用 RunningHub H3；也可以继续完成制作计划。' if fallback == '可用'
-                           else 'H3 视频服务器当前未启动。你可以继续完成镜头和制作计划，启动视频服务器后再生成。')
-            if video == '服务未启动' else ('请在服务端配置 DARL_API_KEY。' if video == '未配置' else 'H3 已按运行配置标记为可用。')}
+            'h3': '可用' if key else '未配置', 'provider': 'darl',
+            'execution_model': execution_model, 'execution_route': H3_EXECUTION_MODELS[execution_model],
+            'self_hosted_h3': ('可用' if key else '未配置') if self_hosted else '服务未启动',
+            'cloud_h3': '可用' if key else '未配置',
+            'h3_message': '请在服务端配置 DARL_API_KEY。' if not key else
+                ('当前执行路线：自建 H3。' if self_hosted else '自建 H3 未开启；新的生成使用云端 H3 · 备用。')}
 
 
 class VersionedInput(BaseModel):
@@ -261,7 +247,6 @@ def create_app(db_path: str | Path | None = None, media_root: str | Path | None 
         if name not in runtime_columns:
             boot.db.execute(f'ALTER TABLE job_runtime ADD COLUMN {name} INTEGER')
     for key,value in {'llm_enabled':'true','image_enabled':'true','h3_enabled':'true',
-                      'runninghub_enabled':'true',
                       'poll_seconds':'180','max_transient':'3','max_download':'2'}.items():
         boot.db.execute('INSERT OR IGNORE INTO system_config(key,value) VALUES (?,?)',(key,value))
     boot.db.commit()
@@ -307,10 +292,6 @@ def create_app(db_path: str | Path | None = None, media_root: str | Path | None 
             if config.get(key)=='false':state[field]='未配置'
         if config.get('h3_enabled')=='false':
             state['h3']='服务未启动';state['h3_message']='H3 视频服务已由本地管理台停用；仍可继续制作计划。'
-        if config.get('runninghub_enabled')=='false':
-            state['runninghub_h3']='已停用'
-        if state['h3']=='服务未启动' and state['runninghub_h3']=='可用':
-            state['h3_message']='本地 H3 未启动，可使用备用 RunningHub H3；也可以继续完成制作计划。'
         return state
 
     def execute(fn):
@@ -1181,8 +1162,8 @@ def create_app(db_path: str | Path | None = None, media_root: str | Path | None 
     def generate(pid: str, cid: str, retry_of: str | None = None,
                  creative_reason: str | None = None, request_id: str | None = None,
                  provider: str | None = None):
-        if provider is not None and provider not in {'darl','runninghub'}:
-            raise HTTPException(400, 'unknown H3 provider')
+        if provider is not None and provider != 'darl':
+            raise HTTPException(400, 'only darl is supported for H3 generation')
         if retry_of and creative_reason is not None:
             raise HTTPException(400, 'technical retry and creative regenerate are separate actions')
         if request_id and (len(request_id)>100 or not request_id.replace('-','').isalnum()):
@@ -1199,14 +1180,14 @@ def create_app(db_path: str | Path | None = None, media_root: str | Path | None 
                 if provider is not None and provider != selected_provider:
                     raise DomainError('技术重试必须沿用原 Provider；切换通道请明确进行创作重生成。')
             state = provider_state()
-            status = state['h3' if selected_provider == 'darl' else 'runninghub_h3']
-            if status != '可用':
+            execution_model = darl_execution_model(original['snapshot']['task']) if original else state['execution_model']
+            if state['h3'] != '可用':
                 raise HTTPException(503, {'code': 'PROVIDER_UNAVAILABLE',
-                                          'message': state['h3_message'] if selected_provider == 'darl'
-                                          else '备用 RunningHub H3 未配置或已停用。'})
+                                          'message': state['h3_message']})
+            if original and execution_model == LOCAL_H3_MODEL and state['self_hosted_h3'] != '可用':
+                raise HTTPException(503, {'code': 'EXECUTION_MODEL_UNAVAILABLE',
+                                          'message': '原任务使用的自建 H3 未开启；技术重试不能切换 execution model。'})
             handoff = original['snapshot']['task']['task_mode'] if original else c.get('clip',cid)['payload']['handoff']
-            if selected_provider == 'runninghub' and handoff == 'VIDEO_CONTINUATION':
-                raise DomainError('RunningHub 的参考视频尚未通过同一长镜头续接验证；此 Clip 不能使用备用通道。')
             if request_id:
                 existing=c.db.execute('SELECT * FROM generation_requests WHERE request_id=?',(request_id,)).fetchone()
                 if existing:
@@ -1250,10 +1231,18 @@ def create_app(db_path: str | Path | None = None, media_root: str | Path | None 
                     task_id=original['task_id']
                     task=c.task(task_id)
                 else:
-                    profile_id='h3-darl' if selected_provider == 'darl' else 'h3-runninghub'
-                    if not any(p['id']==profile_id for p in latest(c,'model_profile')):
-                        profile=darl_h3_profile(False) if selected_provider == 'darl' else runninghub_h3_profile()
+                    profile_id=H3_PROFILE_IDS[execution_model]
+                    profiles=[profile for profile in latest(c,'model_profile') if profile['id']==profile_id]
+                    if not profiles:
+                        profile=darl_h3_profile(False, execution_model=execution_model)
                         c.put('model_profile',profile_id,profile,'documented-profile','documented')
+                    else:
+                        profile=profiles[0]['payload']
+                        if profile['model_id'] != execution_model:
+                            raise DomainError('Darl execution model profile mismatch')
+                        if profile.get('provider') != 'darl' or profile.get('execution_model') != execution_model:
+                            c.put('model_profile',profile_id,{**profile,'provider':'darl','execution_model':execution_model},
+                                  'darl-routing','documented')
                     task_id=uid('task');continuation=None
                     if handoff=='VIDEO_CONTINUATION':
                         dep=c.db.execute("SELECT upstream_clip_id FROM dependencies WHERE clip_id=? AND kind='VIDEO_CONTINUATION'",(cid,)).fetchone()
@@ -1268,14 +1257,15 @@ def create_app(db_path: str | Path | None = None, media_root: str | Path | None 
                                       continuation=continuation)
                 preflight=c.preflight(task_id,retry_of=retry_of)
                 if not preflight.ready: raise DomainError('model preflight not ready: '+json.dumps(preflight.reasons))
-                adapter=DarlH3Adapter() if selected_provider == 'darl' else RunningHubH3Adapter()
+                adapter=DarlH3Adapter()
                 adapter.build_request(task)
                 if not c.preflight(task_id,retry_of=retry_of).ready:
                     raise DomainError('compiled task became stale before submission')
                 attempt='technical_retry' if retry_of else 'creative_regenerate' if creative_reason else 'initial'
                 c.create_job(job_id,task_id,retry_of=retry_of,
-                             cost_estimate={'candidate_limit':1,'resolution':'480P','attempt_kind':attempt,
-                                            'creative_reason':(creative_reason or '')[:500], 'provider':selected_provider})
+                             cost_estimate={'candidate_limit':1,'resolution':task['parameters'].get('resolution'),'attempt_kind':attempt,
+                                            'creative_reason':(creative_reason or '')[:500], 'provider':selected_provider,
+                                            'execution_model':execution_model})
                 created=True
                 if request_id:
                     c.db.execute('UPDATE generation_requests SET job_id=? WHERE request_id=?',(job_id,request_id));c.db.commit()
@@ -1283,13 +1273,15 @@ def create_app(db_path: str | Path | None = None, media_root: str | Path | None 
                     submit_started=time.monotonic()
                     response=adapter.submit(task,job_id)
                 except ProviderError as exc:
-                    c.job_event(job_id,'failed',{'provider':selected_provider,'provider_error':exc.as_dict(),'error_category':exc.code})
+                    c.job_event(job_id,'failed',{'provider':selected_provider,'execution_model':execution_model,
+                                               'provider_error':exc.as_dict(),'error_category':exc.code})
                     c.db.execute('DELETE FROM active_generation WHERE clip_id=? AND job_id=?',(cid,job_id));c.db.commit()
-                    raise HTTPException(503,{'code':'PROVIDER_UNAVAILABLE' if exc.code=='fail_to_fetch_task' and exc.http_status==404 else exc.code,
-                                             'message':'H3 视频服务器当前未启动。' if exc.code=='fail_to_fetch_task' and exc.http_status==404 else '视频服务提交失败。',
+                    self_hosted_offline=execution_model==LOCAL_H3_MODEL and exc.code=='fail_to_fetch_task' and exc.http_status==404
+                    raise HTTPException(503,{'code':'PROVIDER_UNAVAILABLE' if self_hosted_offline else exc.code,
+                                             'message':'自建 H3 视频服务器当前未启动。' if self_hosted_offline else '视频服务提交失败。',
                                              'job_id':job_id}) from exc
                 c.job_event(job_id,'running',{'provider':selected_provider,'provider_task_id':response['id'],
-                                              'provider_status':response['status']})
+                                              'provider_status':response['status'],'execution_model':execution_model})
                 next_poll=(utcnow()+__import__('datetime').timedelta(seconds=180)).isoformat()
                 c.db.execute('INSERT INTO job_runtime(job_id,provider,provider_task_id,next_poll_at,submitted_at,submit_latency_ms) VALUES (?,?,?,?,?,?)',
                              (job_id,selected_provider,response['id'],next_poll,utcnow().isoformat(),round((time.monotonic()-submit_started)*1000)))
@@ -1574,7 +1566,7 @@ def create_app(db_path: str | Path | None = None, media_root: str | Path | None 
         safe_url=urlunsplit((parsed.scheme,parsed.hostname or '',parsed.path,'',''))
         statuses=provider_state()
         def op(c):
-            last=c.db.execute('SELECT last_error_category,last_polled_at FROM job_runtime WHERE last_error_category IS NOT NULL ORDER BY rowid DESC LIMIT 1').fetchone()
+            last=c.db.execute("SELECT last_error_category,last_polled_at FROM job_runtime WHERE provider='darl' AND last_error_category IS NOT NULL ORDER BY rowid DESC LIMIT 1").fetchone()
             checked=utcnow().isoformat()
             return [{'name':'Darl LLM','model':'deepseek-v4.1-flash','status':statuses['llm'],
                      'configured':bool(os.getenv('LLM_API_KEY') or os.getenv('DARL_API_KEY')),
@@ -1582,13 +1574,12 @@ def create_app(db_path: str | Path | None = None, media_root: str | Path | None 
                     {'name':'Darl Image','model':'gpt-image-2','status':statuses['image'],
                      'configured':bool(os.getenv('IMAGE_API_KEY') or os.getenv('DARL_API_KEY')),
                      'base_url':safe_url,'last_checked':checked,'last_error':None},
-                    {'name':'Darl H3','model':'MiniMax-H3','status':statuses['h3'],
+                    {'name':'Darl H3','model':statuses['execution_model'],'status':statuses['h3'],
+                     'execution_models':[{'id':model,'name':name,'status':statuses['self_hosted_h3' if model==LOCAL_H3_MODEL else 'cloud_h3']}
+                                         for model,name in H3_EXECUTION_MODELS.items()],
                      'configured':bool(os.getenv('DARL_API_KEY')),'base_url':safe_url,
                      'last_checked':last['last_polled_at'] if last else checked,
-                     'last_error':last['last_error_category'] if last else None},
-                    {'name':'RunningHub H3 · 备用','model':'MiniMax-H3','status':statuses['runninghub_h3'],
-                     'configured':bool(os.getenv('RUNNINGHUB_API_KEY') and os.getenv('RUNNINGHUB_WEBAPP_ID')),
-                     'base_url':'https://www.runninghub.cn','last_checked':checked,'last_error':None}]
+                     'last_error':last['last_error_category'] if last else None}]
         return execute(op)
 
     @app.get('/api/admin/jobs')
@@ -1603,6 +1594,11 @@ def create_app(db_path: str | Path | None = None, media_root: str | Path | None 
                 task=job['snapshot']['task'];runtime=c.db.execute('SELECT * FROM job_runtime WHERE job_id=?',(job['id'],)).fetchone()
                 result.append({'id':job['id'],'status':job['status'],'test_only':test_mode,
                                'provider':runtime['provider'] if runtime else job['metadata'].get('provider','darl'),
+                               'execution_model':task.get('execution_model',task.get('target_model')),
+                               'legacy_provider':any(value and value!='darl' for value in (
+                                   job['metadata'].get('provider'),task.get('provider'),
+                                   (job['snapshot'].get('cost_estimate') or {}).get('provider'),runtime['provider'] if runtime else None))
+                                   or task.get('model_profile',{}).get('id') not in H3_PROFILE_IDS.values(),
                                'project_id':JobWorker._project_for_clip(c,task['clip_id']),
                                'clip_id':task['clip_id'],'task_id':task['id'],
                                'provider_task_id':job['metadata'].get('provider_task_id') or (runtime['provider_task_id'] if runtime else None),
@@ -1643,16 +1639,24 @@ def create_app(db_path: str | Path | None = None, media_root: str | Path | None 
                         for key,item in value.items()}
             if isinstance(value,list):return [redact(item) for item in value]
             return value
-        return execute(lambda c:[{**dict(r),'payload':redact(json.loads(r['payload']))} for r in c.db.execute(
-            "SELECT * FROM objects WHERE kind='model_profile' ORDER BY id,version DESC LIMIT 100")])
+        def op(c):
+            result=[]
+            for row in c.db.execute("SELECT * FROM objects WHERE kind='model_profile' ORDER BY id,version DESC LIMIT 100"):
+                payload=json.loads(row['payload'])
+                if payload.get('provider','darl')!='darl' or payload.get('transport',{}).get('base_url','https://api.darl.cn')!='https://api.darl.cn':
+                    continue
+                result.append({**dict(row),'payload':redact(payload)})
+            return result
+        return execute(op)
 
     @app.get('/api/admin/config')
     def admin_config():
-        return execute(lambda c:{r['key']:r['value'] for r in c.db.execute('SELECT key,value FROM system_config')})
+        allowed={'llm_enabled','image_enabled','h3_enabled','poll_seconds','max_transient','max_download'}
+        return execute(lambda c:{r['key']:r['value'] for r in c.db.execute('SELECT key,value FROM system_config') if r['key'] in allowed})
 
     @app.post('/api/admin/config')
     def admin_update_config(body: AdminConfigInput):
-        if body.key in {'llm_enabled','image_enabled','h3_enabled','runninghub_enabled'}:
+        if body.key in {'llm_enabled','image_enabled','h3_enabled'}:
             if body.value not in {'true','false'}:raise HTTPException(400,'invalid boolean setting')
         elif body.key=='poll_seconds':
             if not body.value.isdigit() or not 180<=int(body.value)<=900:raise HTTPException(400,'poll interval must be 180–900 seconds')

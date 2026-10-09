@@ -1,17 +1,52 @@
-"""Documented H3 capability for Darl's self-hosted New API transport (#002).
+"""Documented H3 capability for Darl's New API transport.
 
 Official model limits and proxy-specific options are intentionally distinguished.
 Runtime validation promotes a new immutable profile version after a real request.
 """
 from datetime import date
+import os
 
 OFFICIAL_CREATE = "https://platform.minimax.io/docs/api-reference/video-generation-v2-create"
 PROXY_GUIDE = "https://fwr0187eq6.apifox.cn/9352472m0"
+LOCAL_H3_MODEL = "MiniMax-H3"
+CLOUD_H3_MODEL = "runninghub-minimax-h3"
+H3_EXECUTION_MODELS = {LOCAL_H3_MODEL: "自建 H3", CLOUD_H3_MODEL: "云端 H3 · 备用"}
+H3_PROFILE_IDS = {LOCAL_H3_MODEL: "h3-darl", CLOUD_H3_MODEL: "h3-darl-cloud"}
+CLOUD_H3_SUPPORTED_MODES = ["INDEPENDENT", "MULTI_SHOT_ONE_PASS", "STATE_CONTINUE_NEW_VIEW", "VISUAL_ANCHOR"]
 
 
-def darl_h3_profile(runtime_verified=False):
-    return {
-        "family": "H3", "model_id": "MiniMax-H3", "model_version": "H3 via Darl local V2",
+def current_h3_execution_model():
+    return LOCAL_H3_MODEL if os.getenv("H3_SERVER_ON") == "1" else CLOUD_H3_MODEL
+
+
+def h3_execution_capability_reasons(task, profile=None):
+    snapshot = task.get("model_profile_snapshot") or {}
+    profile = profile or {}
+    models = (task.get("execution_model"), task.get("target_model"),
+              snapshot.get("execution_model"), snapshot.get("model_id"),
+              profile.get("execution_model"), profile.get("model_id"))
+    if CLOUD_H3_MODEL not in models and task.get("model_profile", {}).get("id") != H3_PROFILE_IDS[CLOUD_H3_MODEL]:
+        return []
+    reasons = []
+    mode = task.get("task_mode")
+    if mode not in CLOUD_H3_SUPPORTED_MODES:
+        reasons.append({"code": "MODE_UNVERIFIED_OR_UNSUPPORTED", "field": "task_mode"})
+    control = (task.get("control_media_snapshot") or {}).get("payload", {})
+    if mode == "VIDEO_CONTINUATION" or task.get("continuation") or control.get("role") == "stable_tail":
+        reasons.append({"code": "VIDEO_CONTINUATION_UNVERIFIED_OR_UNSUPPORTED", "field": "task_mode"})
+    keyframes = any(binding.get("role") in {"first_frame", "last_frame"}
+                    for binding in task.get("media_bindings", []))
+    if mode == "KEYFRAME_CONSTRAINED" or keyframes:
+        reasons.append({"code": "KEYFRAME_CONSTRAINED_UNVERIFIED_OR_UNSUPPORTED", "field": "task_mode"})
+    return reasons
+
+
+def darl_h3_profile(runtime_verified=False, execution_model=LOCAL_H3_MODEL):
+    if execution_model not in H3_EXECUTION_MODELS:
+        raise ValueError("unsupported Darl H3 execution model")
+    profile = {
+        "family": "H3", "model_id": execution_model, "model_version": "H3 via Darl V2",
+        "provider": "darl", "execution_model": execution_model,
         "source": {"official_model": OFFICIAL_CREATE, "proxy_transport": PROXY_GUIDE},
         "verified_at": date.today().isoformat(),
         "verification_stage": "REAL_REQUEST_CONFIRMED" if runtime_verified else "DOCUMENTED_PENDING_REAL_REQUEST",
@@ -51,3 +86,10 @@ def darl_h3_profile(runtime_verified=False):
         "official_model_output": {"resolutions": ["768P", "2K"], "source": OFFICIAL_CREATE},
         "proxy_output": {"resolutions": ["384P", "480P", "768P"], "source": PROXY_GUIDE},
     }
+    if execution_model == CLOUD_H3_MODEL:
+        profile["supported_modes"] = list(CLOUD_H3_SUPPORTED_MODES)
+        profile["temporal_controls"] = {
+            "verified": False, "first_frame": False, "last_frame": False, "video_continuation": False,
+            "source": None, "verification_stage": "MODEL_SPECIFIC_EVIDENCE_REQUIRED"}
+        profile["media_capability"]["counts"].update({"first_frame": 0, "last_frame": 0})
+    return profile

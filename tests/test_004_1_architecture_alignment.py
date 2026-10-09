@@ -13,6 +13,7 @@ from apps.api.main import create_app
 from film_core import Core, DomainError
 from film_core.darl_h3 import ProviderError
 from film_core.fixture import seed
+from film_core.h3_profile import CLOUD_H3_MODEL, LOCAL_H3_MODEL
 
 
 class ArchitectureAlignmentTests(unittest.TestCase):
@@ -24,12 +25,11 @@ class ArchitectureAlignmentTests(unittest.TestCase):
         seed(Core(str(self.path), test_mode=True), production=True).close()
         environment = patch.dict(os.environ, {
             'DARL_API_KEY': 'TEST-ONLY', 'H3_SERVER_ON': '1',
-            'RUNNINGHUB_API_KEY': 'TEST-ONLY', 'RUNNINGHUB_WEBAPP_ID': '12345',
         })
         environment.start()
         self.addCleanup(environment.stop)
         self.adapters = {}
-        for provider, name in (('darl', 'DarlH3Adapter'), ('runninghub', 'RunningHubH3Adapter')):
+        for provider, name in (('darl', 'DarlH3Adapter'),):
             adapter_patch = patch('apps.api.main.' + name)
             adapter = adapter_patch.start().return_value
             self.addCleanup(adapter_patch.stop)
@@ -44,12 +44,13 @@ class ArchitectureAlignmentTests(unittest.TestCase):
         self.addCleanup(core.close)
         return core
 
-    def failed_job(self, provider='darl'):
-        self.adapters[provider].submit.side_effect = ProviderError('NETWORK_ERROR', 'TEST ONLY', transient=True)
-        response = self.client.post('/api/projects/station-film/clips/A/generate', params={'provider': provider})
+    def failed_job(self, execution_model=LOCAL_H3_MODEL):
+        self.adapters['darl'].submit.side_effect = ProviderError('NETWORK_ERROR', 'TEST ONLY', transient=True)
+        with patch.dict(os.environ, {'H3_SERVER_ON': '1' if execution_model == LOCAL_H3_MODEL else '0'}):
+            response = self.client.post('/api/projects/station-film/clips/A/generate', params={'provider': 'darl'})
         self.assertEqual(response.status_code, 503, response.text)
         job = self.core().job(response.json()['detail']['job_id'])
-        self.adapters[provider].submit.side_effect = None
+        self.adapters['darl'].submit.side_effect = None
         return job
 
     def retry(self, job, endpoint='creator', **parameters):
@@ -71,39 +72,39 @@ class ArchitectureAlignmentTests(unittest.TestCase):
         return response.json()
 
     def test_darl_creator_retry_preserves_provider_and_original_task(self):
-        self.assert_retry_preserved('darl', 'creator')
+        self.assert_retry_preserved(LOCAL_H3_MODEL, 'creator')
 
     def test_darl_admin_retry_preserves_provider_and_original_task(self):
-        self.assert_retry_preserved('darl', 'admin')
+        self.assert_retry_preserved(LOCAL_H3_MODEL, 'admin')
 
-    def test_runninghub_creator_retry_preserves_provider_and_original_task(self):
-        self.assert_retry_preserved('runninghub', 'creator')
+    def test_cloud_creator_retry_preserves_model_and_original_task(self):
+        self.assert_retry_preserved(CLOUD_H3_MODEL, 'creator')
 
-    def test_runninghub_admin_retry_preserves_provider_with_darl_offline(self):
+    def test_cloud_admin_retry_preserves_model_with_self_hosted_offline(self):
         with patch.dict(os.environ, {'H3_SERVER_ON': '0'}):
-            self.assert_retry_preserved('runninghub', 'admin')
+            self.assert_retry_preserved(CLOUD_H3_MODEL, 'admin')
 
-    def assert_retry_preserved(self, provider, endpoint):
-        original = self.failed_job(provider)
+    def assert_retry_preserved(self, execution_model, endpoint):
+        original = self.failed_job(execution_model)
         before = copy.deepcopy(original)
         brief = self.core().get('brief', 'brief:A')
         response = self.retry(original, endpoint)
         self.assertEqual(response.status_code, 200, response.text)
         retried = response.json()['job']
-        self.assertEqual(retried['metadata']['provider'], provider)
-        self.assertEqual(retried['snapshot']['cost_estimate']['provider'], provider)
+        self.assertEqual(retried['metadata']['provider'], 'darl')
+        self.assertEqual(retried['snapshot']['cost_estimate']['provider'], 'darl')
+        self.assertEqual(retried['snapshot']['task']['execution_model'], execution_model)
         self.assertEqual(retried['snapshot']['retry_of'], original['id'])
         self.assertEqual(retried['snapshot']['task'], original['snapshot']['task'])
-        self.assertEqual(self.adapters[provider].submit.call_args.args[0], original['snapshot']['task'])
+        self.assertEqual(self.adapters['darl'].submit.call_args.args[0], original['snapshot']['task'])
         self.assertEqual(self.core().get('brief', 'brief:A'), brief)
         self.assertEqual(self.core().job(original['id']), before)
-        self.adapters['runninghub' if provider == 'darl' else 'darl'].submit.assert_not_called()
 
     def test_latest_brief_and_profile_changes_do_not_change_retry_inputs(self):
-        original = self.failed_job('runninghub')
+        original = self.failed_job(CLOUD_H3_MODEL)
         revised = self.revise_brief()
         core = self.core()
-        profile = core.get('model_profile', 'h3-runninghub')
+        profile = core.get('model_profile', 'h3-darl-cloud')
         core.put('model_profile', profile['id'], {**profile['payload'], 'note': 'TEST ONLY new profile'}, 'TEST-ONLY')
         with patch('film_core.core.Core.compile_h3', side_effect=AssertionError('retry must not recompile')):
             response = self.retry(original, 'admin')
@@ -228,35 +229,37 @@ class ArchitectureAlignmentTests(unittest.TestCase):
         self.assertEqual(core.db.execute('SELECT COUNT(*) FROM jobs').fetchone()[0], 1)
 
     def test_provider_switch_on_retry_is_rejected(self):
-        original = self.failed_job('runninghub')
-        response = self.retry(original, provider='darl')
+        original = self.failed_job()
+        self.adapters['darl'].submit.reset_mock()
+        response = self.retry(original, provider='retired-provider')
         self.assertEqual(response.status_code, 400, response.text)
         self.adapters['darl'].submit.assert_not_called()
         self.assertEqual(self.core().db.execute('SELECT COUNT(*) FROM jobs').fetchone()[0], 1)
 
     def test_unavailable_original_provider_is_reported_without_fallback(self):
-        original = self.failed_job('runninghub')
-        self.adapters['runninghub'].submit.reset_mock()
-        with patch.dict(os.environ, {'RUNNINGHUB_API_KEY': ''}):
+        original = self.failed_job()
+        self.adapters['darl'].submit.reset_mock()
+        with patch.dict(os.environ, {'DARL_API_KEY': ''}):
             for endpoint in ('creator', 'admin'):
                 with self.subTest(endpoint=endpoint):
                     response = self.retry(original, endpoint)
                     self.assertEqual(response.status_code, 503, response.text)
                     self.assertEqual(response.json()['detail']['code'], 'PROVIDER_UNAVAILABLE')
         self.adapters['darl'].submit.assert_not_called()
-        self.adapters['runninghub'].submit.assert_not_called()
 
     def test_creative_regenerate_uses_latest_brief_and_is_not_a_retry(self):
         original = self.failed_job()
         revised = self.revise_brief()
-        response = self.client.post('/api/projects/station-film/clips/A/generate',
-                                    params={'creative_reason': 'TEST ONLY 接受新方案', 'provider': 'runninghub'})
+        with patch.dict(os.environ, {'H3_SERVER_ON': '0'}):
+            response = self.client.post('/api/projects/station-film/clips/A/generate',
+                                        params={'creative_reason': 'TEST ONLY 接受新方案', 'provider': 'darl'})
         self.assertEqual(response.status_code, 200, response.text)
         regenerated = response.json()['job']
         self.assertIsNone(regenerated['snapshot']['retry_of'])
         self.assertEqual(regenerated['snapshot']['cost_estimate']['attempt_kind'], 'creative_regenerate')
         self.assertEqual(regenerated['snapshot']['task']['source_brief']['version'], revised['version'])
         self.assertNotEqual(regenerated['task_id'], original['task_id'])
+        self.assertEqual(regenerated['snapshot']['task']['execution_model'], CLOUD_H3_MODEL)
         self.assertEqual(self.core().job(original['id']), original)
 
     def test_retry_and_creative_reason_cannot_be_combined(self):
@@ -313,8 +316,8 @@ class ArchitectureAlignmentTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()['job']['metadata']['provider'], 'darl')
 
-    def test_runninghub_profile_prevents_darl_fallback_when_provider_fields_are_missing(self):
-        original = self.failed_job('runninghub')
+    def test_cloud_profile_recovers_provider_when_legacy_fields_are_missing(self):
+        original = self.failed_job(CLOUD_H3_MODEL)
         core = self.core()
         snapshot = copy.deepcopy(original['snapshot'])
         snapshot['cost_estimate'].pop('provider')
@@ -325,22 +328,21 @@ class ArchitectureAlignmentTests(unittest.TestCase):
         with patch.dict(os.environ, {'H3_SERVER_ON': '0'}):
             response = self.retry(original, 'admin')
         self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(response.json()['job']['metadata']['provider'], 'runninghub')
-        self.adapters['darl'].submit.assert_not_called()
+        self.assertEqual(response.json()['job']['metadata']['provider'], 'darl')
+        self.assertEqual(response.json()['job']['snapshot']['task']['execution_model'], CLOUD_H3_MODEL)
 
     def test_conflicting_provider_provenance_is_rejected(self):
-        original = self.failed_job('runninghub')
+        original = self.failed_job(CLOUD_H3_MODEL)
         core = self.core()
         snapshot = copy.deepcopy(original['snapshot'])
-        snapshot['cost_estimate']['provider'] = 'darl'
+        snapshot['cost_estimate']['provider'] = 'retired-provider'
         core.db.execute('UPDATE jobs SET snapshot=? WHERE id=?', (json.dumps(snapshot), original['id']))
         core.db.commit()
-        self.adapters['runninghub'].submit.reset_mock()
+        self.adapters['darl'].submit.reset_mock()
         for endpoint in ('creator', 'admin'):
             response = self.retry(original, endpoint)
             self.assertEqual(response.status_code, 400, response.text)
         self.adapters['darl'].submit.assert_not_called()
-        self.adapters['runninghub'].submit.assert_not_called()
 
 
 if __name__ == '__main__':

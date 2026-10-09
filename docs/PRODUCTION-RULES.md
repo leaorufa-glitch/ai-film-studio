@@ -111,3 +111,11 @@
 74. 05 因为已有真实视频，采用 Player First。
 75. 前台尽量用自然创作语言，不暴露无必要的系统术语。
 76. 用户不需要手动管理 Prompt、Asset ID、Dependency Graph、Compiler Version 等内部信息。
+
+## L. Darl-Only H3 Routing
+
+77. 唯一视频 Provider 为 `darl`，通过 `https://api.darl.cn/v1/videos` 提交；不维护旧备用直连 Provider 或其凭证、节点映射、上传、查询和 Adapter。
+78. `MiniMax-H3` 与 `runninghub-minimax-h3` 是同一 Darl Provider 下的 execution model。新生成按 `H3_SERVER_ON` 选择自建或云端备用；前台明确显示路线。
+79. Final Brief 不因执行路线改变而改变。Compiled Task / Job snapshot 必须记录实际执行模型，且 Technical Retry 冻结原 Provider、Task、execution model、参数和引用。
+80. 原自建模型关闭时，其 Technical Retry 必须拒绝，不允许改用云端。改变 execution model 属于新的 execution / Creative Regenerate。
+81. 旧非 Darl Provider Job 保留为只读历史；不得恢复执行或技术重试，使用 `LEGACY_PROVIDER_UNSUPPORTED` 或等价明确错误拒绝，不迁移历史 Job。
