@@ -10,7 +10,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from .core import DomainError
-from .h3_profile import H3_EXECUTION_MODELS
+from .h3_profile import H3_EXECUTION_MODELS, h3_execution_capability_reasons
 
 
 def darl_execution_model(task):
@@ -22,6 +22,9 @@ def darl_execution_model(task):
         raise DomainError("execution model differs from frozen profile")
     if task.get("provider", "darl") != "darl":
         raise DomainError("LEGACY_PROVIDER_UNSUPPORTED")
+    reasons = h3_execution_capability_reasons(task)
+    if reasons:
+        raise DomainError("model capability not ready: " + json.dumps(reasons))
     return model
 
 

@@ -90,3 +90,20 @@ Python 安全命令见 README。浏览器执行 `npm run test:e2e --prefix apps/
 - 本分支提交并 push 后立即停止，等待架构验收；不合并 main、不真实生成、不启动 #005。
 
 修复 SHA 以本报告所属 Git commit 为准，使用 `git log -1 --format=%H -- docs/reports/darl-only-h3-routing-report.md` 查询。
+
+## 6. 定点修正：云端能力保护与 404 分类
+
+基线：`2087cdc87d8652db136bb6611a58189b55b0c13f`；继续使用 `refactor/darl-only-h3-routing`。以下规则补充并取代初始实现中云端特殊时序能力继承的部分；状态为修正完成、等待架构负责人再次独立验收，不宣称架构验收 PASS。
+
+- 云端 `runninghub-minimax-h3` 仅保留基础 `INDEPENDENT`、`MULTI_SHOT_ONE_PASS`、`STATE_CONTINUE_NEW_VIEW`、`VISUAL_ANCHOR` 模式。`VIDEO_CONTINUATION` 与 `KEYFRAME_CONSTRAINED` 在缺少模型专属证据前禁用；temporal controls 的 verified / continuation / first frame / last frame 均为 false，首尾帧容量为 0。单次基础请求成功不能将特殊能力自动标为已验证。
+- 增加小范围的当前 execution capability guard：Preflight 读取原版本快照后叠加现行能力限制；Darl 执行输入校验使用同一保护。因此数据库中旧的、过度声明能力的云端 Profile / Compiled Task，以及原任务 Technical Retry，都不能绕过保护。不会迁移、回写或伪造历史快照，也不会修改任务模式。
+- 检查任务模式及实际 continuation / Stable Tail / first-frame / last-frame 输入，避免将特殊输入挂在基础任务模式下绕过禁用。旧云端特殊任务不能在 Runtime 恢复后继续执行；历史 Job 保持原样。
+- 自建 `MiniMax-H3` 的完整 Profile 与本次基线逐字段比较一致；既有 VIDEO_CONTINUATION / KEYFRAME_CONSTRAINED 合同不变。Clip A 的两条执行路线仍为 `MULTI_SHOT_ONE_PASS` 且 Preflight 可通过，Final Brief 不因保护规则改变。
+- 只有自建执行模型的 `fail_to_fetch_task + HTTP 404` 归类为自建服务不可用。云端返回相同 code 或通用 HTTP 404 时，API 保留真实错误类别，不解释为自建服务器关闭；Job 中保留 Provider code / message / HTTP status。失败不自动切换模型。
+- 技术重试、Legacy Provider 只读拒绝与已有 Job / Take 关系保持原合同。不重启生产 API，不部署，不合并 main，不真实提交 H3，不开始 #005。
+
+本次仅修改 `film_core/h3_profile.py`、`film_core/core.py`、`film_core/darl_h3.py`、`apps/api/main.py`、新增 `tests/test_darl_h3_capability_guards.py`，并更新本报告。没有 schema 迁移或 Production Core 真相语义重构。
+
+回归结果：新增定点测试 **17/17 PASS**；全量 Python **100/100 PASS**；Playwright **12/12 PASS**；Next.js production build **PASS**；`git diff --check` **PASS**。所有网络为 Mock / TEST ONLY，Python 测试发现前禁止外部 HTTP；模块级 App、E2E 使用隔离数据库。自建完整 Profile 与基线的一致性额外验证通过。真实 Clip A 原 Job / Compiled Task / `brief:A v1` 只读校验不变，没有新增真实 Job 或 Take。
+
+真实影片验证、云端特殊时序能力证据与 Admin 正式身份认证仍未完成。Commit / push 本分支后停止，等待独立架构验收。

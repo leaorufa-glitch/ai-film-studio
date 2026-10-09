@@ -1276,8 +1276,9 @@ def create_app(db_path: str | Path | None = None, media_root: str | Path | None 
                     c.job_event(job_id,'failed',{'provider':selected_provider,'execution_model':execution_model,
                                                'provider_error':exc.as_dict(),'error_category':exc.code})
                     c.db.execute('DELETE FROM active_generation WHERE clip_id=? AND job_id=?',(cid,job_id));c.db.commit()
-                    raise HTTPException(503,{'code':'PROVIDER_UNAVAILABLE' if exc.code=='fail_to_fetch_task' and exc.http_status==404 else exc.code,
-                                             'message':'H3 视频服务器当前未启动。' if exc.code=='fail_to_fetch_task' and exc.http_status==404 else '视频服务提交失败。',
+                    self_hosted_offline=execution_model==LOCAL_H3_MODEL and exc.code=='fail_to_fetch_task' and exc.http_status==404
+                    raise HTTPException(503,{'code':'PROVIDER_UNAVAILABLE' if self_hosted_offline else exc.code,
+                                             'message':'自建 H3 视频服务器当前未启动。' if self_hosted_offline else '视频服务提交失败。',
                                              'job_id':job_id}) from exc
                 c.job_event(job_id,'running',{'provider':selected_provider,'provider_task_id':response['id'],
                                               'provider_status':response['status'],'execution_model':execution_model})
