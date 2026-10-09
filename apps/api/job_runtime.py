@@ -14,6 +14,7 @@ from pathlib import Path
 
 from film_core import Core, DomainError
 from film_core.darl_h3 import DarlH3Adapter, ProviderError
+from .runninghub_h3 import RunningHubH3Adapter
 
 log=logging.getLogger('film_studio.job_runtime')
 
@@ -24,11 +25,13 @@ def utcnow():
 
 class JobWorker:
     def __init__(self, db_path, media_root, *, test_mode=False, adapter_factory=DarlH3Adapter,
+                 runninghub_factory=RunningHubH3Adapter,
                  poll_seconds=180, max_transient=3, max_download=2):
         self.db_path=str(db_path)
         self.media_root=Path(media_root)
         self.test_mode=test_mode
         self.adapter_factory=adapter_factory
+        self.runninghub_factory=runninghub_factory
         self.poll_seconds=max(0,poll_seconds) if test_mode else max(180,poll_seconds)
         self.max_transient=max(1,max_transient)
         self.max_download=max(1,max_download)
@@ -60,8 +63,9 @@ class JobWorker:
                     event=c.db.execute('SELECT created_at FROM job_events WHERE job_id=? ORDER BY id DESC LIMIT 1',(jid,)).fetchone()
                     try:resume_at=max(utcnow(),datetime.fromisoformat(event['created_at'])+timedelta(seconds=self.poll_seconds))
                     except (TypeError,ValueError):resume_at=utcnow()+timedelta(seconds=self.poll_seconds)
-                    c.db.execute('INSERT OR IGNORE INTO job_runtime(job_id,provider_task_id,next_poll_at,submitted_at) VALUES (?,?,?,?)',
-                                 (jid,provider_id,resume_at.isoformat(),job['created_at']))
+                    provider=job['metadata'].get('provider') or (job['snapshot'].get('cost_estimate') or {}).get('provider','darl')
+                    c.db.execute('INSERT OR IGNORE INTO job_runtime(job_id,provider,provider_task_id,next_poll_at,submitted_at) VALUES (?,?,?,?,?)',
+                                 (jid,provider,provider_id,resume_at.isoformat(),job['created_at']))
                 elif job['status']=='queued':
                     c.job_event(jid,'failed',{'error_category':'SUBMISSION_UNKNOWN','message':'Submit was interrupted before task id; no automatic resubmit'})
                     c.db.execute('DELETE FROM active_generation WHERE job_id=?',(jid,))
@@ -116,14 +120,29 @@ class JobWorker:
         if job['status']!='running':
             c.db.execute('UPDATE job_runtime SET next_poll_at=NULL WHERE job_id=?',(jid,));c.db.commit();return
         runtime=c.db.execute('SELECT * FROM job_runtime WHERE job_id=?',(jid,)).fetchone()
-        enabled=c.db.execute("SELECT value FROM system_config WHERE key='h3_enabled'").fetchone()
-        if not self.test_mode and (os.getenv('H3_SERVER_ON')!='1' or enabled and enabled['value']=='false'):
+        provider=runtime['provider'] or job['metadata'].get('provider') or 'darl'
+        flag='h3_enabled' if provider=='darl' else 'runninghub_enabled'
+        enabled=c.db.execute('SELECT value FROM system_config WHERE key=?',(flag,)).fetchone()
+        offline=(provider=='darl' and os.getenv('H3_SERVER_ON')!='1')
+        if not self.test_mode and (offline or enabled and enabled['value']=='false'):
             c.db.execute('UPDATE job_runtime SET next_poll_at=?,last_error_category=? WHERE job_id=?',
                          (self._schedule(0),'PROVIDER_OFFLINE',jid));c.db.commit();return
+        credentials_ready=(bool(os.getenv('DARL_API_KEY')) if provider=='darl' else
+                           bool(os.getenv('RUNNINGHUB_API_KEY') and os.getenv('RUNNINGHUB_WEBAPP_ID')))
+        if not credentials_ready:
+            c.db.execute('UPDATE job_runtime SET next_poll_at=?,last_error_category=? WHERE job_id=?',
+                         (self._schedule(0),'PROVIDER_NOT_CONFIGURED',jid));c.db.commit();return
+        try:
+            adapter=self.adapter_factory() if provider=='darl' else self.runninghub_factory() if provider=='runninghub' else None
+        except DomainError:
+            c.db.execute('UPDATE job_runtime SET next_poll_at=?,last_error_category=? WHERE job_id=?',
+                         (self._schedule(0),'PROVIDER_NOT_CONFIGURED',jid));c.db.commit();return
+        if adapter is None:
+            self._fail(c,jid,'UNKNOWN_PROVIDER','任务使用的 Provider 不受支持。');return
         provider_id=runtime['provider_task_id']
         try:
             poll_started=time.monotonic()
-            response=self.adapter_factory().poll(provider_id)
+            response=adapter.poll(provider_id)
         except ProviderError as exc:
             count=runtime['transient_count']+1
             if exc.transient and count<=self.max_transient:
@@ -134,20 +153,20 @@ class JobWorker:
                      (round((time.monotonic()-poll_started)*1000),utcnow().isoformat(),jid))
         c.db.commit()
         if response['status']=='failed':
-            self._fail(c,jid,'PROVIDER_FAILED','视频服务报告生成失败。');return
+            self._fail(c,jid,response.get('error_code') or 'PROVIDER_FAILED','视频服务报告生成失败。');return
         if response['status']!='succeeded':
             polls=runtime['poll_count']+1
             c.db.execute('UPDATE job_runtime SET poll_count=?,transient_count=0,next_poll_at=?,last_polled_at=? WHERE job_id=?',
                          (polls,self._schedule(polls),utcnow().isoformat(),jid));c.db.commit();return
-        self._download_success(c,job,response,runtime)
+        self._download_success(c,job,response,runtime,adapter)
 
-    def _download_success(self,c,job,response,runtime):
+    def _download_success(self,c,job,response,runtime,adapter):
         jid=job['id'];task=job['snapshot']['task'];provider_id=runtime['provider_task_id']
         self.media_root.mkdir(parents=True,exist_ok=True)
         destination=self.media_root/('take-'+jid+'.mp4')
         try:
             download_started=time.monotonic()
-            info=self.adapter_factory().download(provider_id,destination)
+            info=adapter.download(provider_id,destination)
             target=Path(info['local_path']).resolve()
             if not target.is_file() or not target.is_relative_to(self.media_root.resolve()):
                 raise DomainError('download outside managed media root')
@@ -162,13 +181,13 @@ class JobWorker:
             if not c.db.execute('SELECT 1 FROM media_records WHERE id=?',(media_id,)).fetchone():
                 c.register_media(media_id,info['local_path'],info['sha256'],info['size_bytes'],info['mime'],
                                  duration=info.get('duration'),metadata={**info.get('metadata',{}),
-                                 'kind':'video_take','source':'provider','provider':'darl',
+                                 'kind':'video_take','source':'provider','provider':runtime['provider'],
                                  'project_id':self._project_for_clip(c,task['clip_id']),
                                  'clip_id':task['clip_id'],'job_id':jid,'width':width,'height':height,
                                  'test_only':self.test_mode})
-            c.job_event(jid,'succeeded',{'provider_task_id':provider_id,'media_id':media_id,
+            c.job_event(jid,'succeeded',{'provider':runtime['provider'],'provider_task_id':provider_id,'media_id':media_id,
                                         'provider_status':'succeeded'})
-            c.record_take('take-'+jid,jid,str(target),{'provider_task_id':provider_id},
+            c.record_take('take-'+jid,jid,str(target),{'provider':runtime['provider'],'provider_task_id':provider_id},
                           test_only=self.test_mode,media_id=media_id)
             c.db.execute('UPDATE job_runtime SET completed_at=?,next_poll_at=NULL,last_error_category=NULL,download_latency_ms=? WHERE job_id=?',
                          (utcnow().isoformat(),round((time.monotonic()-download_started)*1000),jid))

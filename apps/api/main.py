@@ -22,6 +22,7 @@ from film_core.darl_h3 import DarlH3Adapter, ProviderError
 from film_core.h3_profile import darl_h3_profile
 from .ai_providers import AIProviderError, DarlImageAdapter, DarlLLMAdapter
 from .job_runtime import JobWorker, utcnow
+from .runninghub_h3 import RunningHubH3Adapter, runninghub_h3_profile
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DB = ROOT / 'output' / 'h3-002-2026-10-09' / 'production.sqlite'
@@ -52,7 +53,8 @@ CREATE TABLE IF NOT EXISTS asset_candidates (
  provenance TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, resolved_at TEXT);
 CREATE TABLE IF NOT EXISTS job_runtime (
- job_id TEXT PRIMARY KEY, provider_task_id TEXT, next_poll_at TEXT, poll_count INTEGER NOT NULL DEFAULT 0,
+ job_id TEXT PRIMARY KEY, provider TEXT NOT NULL DEFAULT 'darl',
+ provider_task_id TEXT, next_poll_at TEXT, poll_count INTEGER NOT NULL DEFAULT 0,
  transient_count INTEGER NOT NULL DEFAULT 0, download_attempts INTEGER NOT NULL DEFAULT 0,
  last_error_category TEXT, last_error TEXT, submitted_at TEXT, last_polled_at TEXT,
  completed_at TEXT, lease_owner TEXT, lease_until TEXT,
@@ -129,10 +131,12 @@ def mark_impact(core: Core, project_id: str, source_kind: str, source_id: str,
 def provider_status() -> dict:
     key = os.getenv('DARL_API_KEY')
     video = '服务未启动' if os.getenv('H3_SERVER_ON') != '1' else ('可用' if key else '未配置')
+    fallback = '可用' if os.getenv('RUNNINGHUB_API_KEY') and (os.getenv('RUNNINGHUB_WEBAPP_ID') or '').isdigit() else '未配置'
     return {'llm': '未配置' if not (os.getenv('LLM_API_KEY') or key) else '可用',
             'image': '未配置' if not (os.getenv('IMAGE_API_KEY') or key) else '可用',
-            'h3': video,
-            'h3_message': 'H3 视频服务器当前未启动。你可以继续完成镜头和制作计划，启动视频服务器后再生成。'
+            'h3': video, 'runninghub_h3': fallback,
+            'h3_message': ('本地 H3 未启动，可使用备用 RunningHub H3；也可以继续完成制作计划。' if fallback == '可用'
+                           else 'H3 视频服务器当前未启动。你可以继续完成镜头和制作计划，启动视频服务器后再生成。')
             if video == '服务未启动' else ('请在服务端配置 DARL_API_KEY。' if video == '未配置' else 'H3 已按运行配置标记为可用。')}
 
 
@@ -236,10 +240,13 @@ def create_app(db_path: str | Path | None = None, media_root: str | Path | None 
     boot = Core(str(path), test_mode=test_mode)
     boot.db.executescript(APP_SCHEMA)
     runtime_columns={r['name'] for r in boot.db.execute('PRAGMA table_info(job_runtime)')}
+    if 'provider' not in runtime_columns:
+        boot.db.execute("ALTER TABLE job_runtime ADD COLUMN provider TEXT NOT NULL DEFAULT 'darl'")
     for name in ('submit_latency_ms','poll_latency_ms','download_latency_ms'):
         if name not in runtime_columns:
             boot.db.execute(f'ALTER TABLE job_runtime ADD COLUMN {name} INTEGER')
     for key,value in {'llm_enabled':'true','image_enabled':'true','h3_enabled':'true',
+                      'runninghub_enabled':'true',
                       'poll_seconds':'180','max_transient':'3','max_download':'2'}.items():
         boot.db.execute('INSERT OR IGNORE INTO system_config(key,value) VALUES (?,?)',(key,value))
     boot.db.commit()
@@ -285,6 +292,10 @@ def create_app(db_path: str | Path | None = None, media_root: str | Path | None 
             if config.get(key)=='false':state[field]='未配置'
         if config.get('h3_enabled')=='false':
             state['h3']='服务未启动';state['h3_message']='H3 视频服务已由本地管理台停用；仍可继续制作计划。'
+        if config.get('runninghub_enabled')=='false':
+            state['runninghub_h3']='已停用'
+        if state['h3']=='服务未启动' and state['runninghub_h3']=='可用':
+            state['h3_message']='本地 H3 未启动，可使用备用 RunningHub H3；也可以继续完成制作计划。'
         return state
 
     def execute(fn):
@@ -1153,16 +1164,24 @@ def create_app(db_path: str | Path | None = None, media_root: str | Path | None 
 
     @app.post('/api/projects/{pid}/clips/{cid}/generate')
     def generate(pid: str, cid: str, retry_of: str | None = None,
-                 creative_reason: str | None = None, request_id: str | None = None):
-        status = provider_state()['h3']
+                 creative_reason: str | None = None, request_id: str | None = None,
+                 provider: str = 'darl'):
+        if provider not in {'darl','runninghub'}:
+            raise HTTPException(400, 'unknown H3 provider')
+        state = provider_state()
+        status = state['h3' if provider == 'darl' else 'runninghub_h3']
         if status != '可用':
-            raise HTTPException(503, {'code': 'PROVIDER_UNAVAILABLE', 'message': provider_state()['h3_message']})
+            raise HTTPException(503, {'code': 'PROVIDER_UNAVAILABLE',
+                                      'message': state['h3_message'] if provider == 'darl'
+                                      else '备用 RunningHub H3 未配置或已停用。'})
         if retry_of and creative_reason:
             raise HTTPException(400, 'technical retry and creative regenerate are separate actions')
         if request_id and (len(request_id)>100 or not request_id.replace('-','').isalnum()):
             raise HTTPException(400, 'invalid request id')
         def op(c):
             belong(c, 'clip', cid, pid)
+            if provider == 'runninghub' and c.get('clip',cid)['payload']['handoff']=='VIDEO_CONTINUATION':
+                raise DomainError('RunningHub 的参考视频尚未通过同一长镜头续接验证；此 Clip 不能使用备用通道。')
             if request_id:
                 existing=c.db.execute('SELECT * FROM generation_requests WHERE request_id=?',(request_id,)).fetchone()
                 if existing:
@@ -1180,6 +1199,9 @@ def create_app(db_path: str | Path | None = None, media_root: str | Path | None 
             if retry_of:
                 if not previous or previous[0]['id']!=retry_of or previous[0]['status']!='failed':
                     raise DomainError('技术重试必须指向此 Clip 最新的失败 Job。')
+                original_provider=previous[0]['metadata'].get('provider') or (previous[0]['snapshot'].get('cost_estimate') or {}).get('provider','darl')
+                if provider != original_provider:
+                    raise DomainError('技术重试必须沿用原 Provider；切换通道请明确进行创作重生成。')
                 chain=0;parent=previous[0]
                 while parent['snapshot'].get('retry_of'):
                     chain+=1;parent=c.job(parent['snapshot']['retry_of'])
@@ -1202,9 +1224,10 @@ def create_app(db_path: str | Path | None = None, media_root: str | Path | None 
                 raise HTTPException(409,'此 Clip 已有提交中的任务；请刷新状态。') from exc
             created=False
             try:
-                profile_id='h3-darl'
+                profile_id='h3-darl' if provider == 'darl' else 'h3-runninghub'
                 if not any(p['id']==profile_id for p in latest(c,'model_profile')):
-                    c.put('model_profile',profile_id,darl_h3_profile(False),'documented-profile','documented')
+                    profile=darl_h3_profile(False) if provider == 'darl' else runninghub_h3_profile()
+                    c.put('model_profile',profile_id,profile,'documented-profile','documented')
                 task_id=uid('task');continuation=None
                 if c.get('clip',cid)['payload']['handoff']=='VIDEO_CONTINUATION':
                     dep=c.db.execute("SELECT upstream_clip_id FROM dependencies WHERE clip_id=? AND kind='VIDEO_CONTINUATION'",(cid,)).fetchone()
@@ -1219,14 +1242,14 @@ def create_app(db_path: str | Path | None = None, media_root: str | Path | None 
                                   continuation=continuation)
                 preflight=c.preflight(task_id)
                 if not preflight.ready: raise DomainError('model preflight not ready: '+json.dumps(preflight.reasons))
-                adapter=DarlH3Adapter()
+                adapter=DarlH3Adapter() if provider == 'darl' else RunningHubH3Adapter()
                 adapter.build_request(task)
                 if not c.preflight(task_id).ready:
                     raise DomainError('compiled task became stale before submission')
                 attempt='technical_retry' if retry_of else 'creative_regenerate' if creative_reason else 'initial'
                 c.create_job(job_id,task_id,retry_of=retry_of,
                              cost_estimate={'candidate_limit':1,'resolution':'480P','attempt_kind':attempt,
-                                            'creative_reason':(creative_reason or '')[:500]})
+                                            'creative_reason':(creative_reason or '')[:500], 'provider':provider})
                 created=True
                 if request_id:
                     c.db.execute('UPDATE generation_requests SET job_id=? WHERE request_id=?',(job_id,request_id));c.db.commit()
@@ -1234,15 +1257,16 @@ def create_app(db_path: str | Path | None = None, media_root: str | Path | None 
                     submit_started=time.monotonic()
                     response=adapter.submit(task,job_id)
                 except ProviderError as exc:
-                    c.job_event(job_id,'failed',{'provider_error':exc.as_dict(),'error_category':exc.code})
+                    c.job_event(job_id,'failed',{'provider':provider,'provider_error':exc.as_dict(),'error_category':exc.code})
                     c.db.execute('DELETE FROM active_generation WHERE clip_id=? AND job_id=?',(cid,job_id));c.db.commit()
                     raise HTTPException(503,{'code':'PROVIDER_UNAVAILABLE' if exc.code=='fail_to_fetch_task' and exc.http_status==404 else exc.code,
                                              'message':'H3 视频服务器当前未启动。' if exc.code=='fail_to_fetch_task' and exc.http_status==404 else '视频服务提交失败。',
                                              'job_id':job_id}) from exc
-                c.job_event(job_id,'running',{'provider_task_id':response['id'],'provider_status':response['status']})
+                c.job_event(job_id,'running',{'provider':provider,'provider_task_id':response['id'],
+                                              'provider_status':response['status']})
                 next_poll=(utcnow()+__import__('datetime').timedelta(seconds=180)).isoformat()
-                c.db.execute('INSERT INTO job_runtime(job_id,provider_task_id,next_poll_at,submitted_at,submit_latency_ms) VALUES (?,?,?,?,?)',
-                             (job_id,response['id'],next_poll,utcnow().isoformat(),round((time.monotonic()-submit_started)*1000)))
+                c.db.execute('INSERT INTO job_runtime(job_id,provider,provider_task_id,next_poll_at,submitted_at,submit_latency_ms) VALUES (?,?,?,?,?,?)',
+                             (job_id,provider,response['id'],next_poll,utcnow().isoformat(),round((time.monotonic()-submit_started)*1000)))
                 c.db.commit()
                 return {'job':c.job(job_id),'expected_minutes':3}
             except Exception:
@@ -1535,7 +1559,10 @@ def create_app(db_path: str | Path | None = None, media_root: str | Path | None 
                     {'name':'Darl H3','model':'MiniMax-H3','status':statuses['h3'],
                      'configured':bool(os.getenv('DARL_API_KEY')),'base_url':safe_url,
                      'last_checked':last['last_polled_at'] if last else checked,
-                     'last_error':last['last_error_category'] if last else None}]
+                     'last_error':last['last_error_category'] if last else None},
+                    {'name':'RunningHub H3 · 备用','model':'MiniMax-H3','status':statuses['runninghub_h3'],
+                     'configured':bool(os.getenv('RUNNINGHUB_API_KEY') and os.getenv('RUNNINGHUB_WEBAPP_ID')),
+                     'base_url':'https://www.runninghub.cn','last_checked':checked,'last_error':None}]
         return execute(op)
 
     @app.get('/api/admin/jobs')
@@ -1548,7 +1575,9 @@ def create_app(db_path: str | Path | None = None, media_root: str | Path | None 
                 job=c.job(row['id'])
                 if status and job['status']!=status:continue
                 task=job['snapshot']['task'];runtime=c.db.execute('SELECT * FROM job_runtime WHERE job_id=?',(job['id'],)).fetchone()
-                result.append({'id':job['id'],'status':job['status'],'test_only':test_mode,'project_id':JobWorker._project_for_clip(c,task['clip_id']),
+                result.append({'id':job['id'],'status':job['status'],'test_only':test_mode,
+                               'provider':runtime['provider'] if runtime else job['metadata'].get('provider','darl'),
+                               'project_id':JobWorker._project_for_clip(c,task['clip_id']),
                                'clip_id':task['clip_id'],'task_id':task['id'],
                                'provider_task_id':job['metadata'].get('provider_task_id') or (runtime['provider_task_id'] if runtime else None),
                                'retry_of':job['snapshot'].get('retry_of'),'attempt':(job['snapshot'].get('cost_estimate') or {}).get('attempt_kind','legacy'),
@@ -1597,7 +1626,7 @@ def create_app(db_path: str | Path | None = None, media_root: str | Path | None 
 
     @app.post('/api/admin/config')
     def admin_update_config(body: AdminConfigInput):
-        if body.key in {'llm_enabled','image_enabled','h3_enabled'}:
+        if body.key in {'llm_enabled','image_enabled','h3_enabled','runninghub_enabled'}:
             if body.value not in {'true','false'}:raise HTTPException(400,'invalid boolean setting')
         elif body.key=='poll_seconds':
             if not body.value.isdigit() or not 180<=int(body.value)<=900:raise HTTPException(400,'poll interval must be 180–900 seconds')

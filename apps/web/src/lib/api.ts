@@ -1,7 +1,7 @@
 export const API = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000';
 export type Entity = { id: string; kind: string; version: number; status: string; payload: Record<string, any>; created_at: string; is_current?: boolean };
 export type Clip = Entity & { mappings: any[]; mapping_revision: number; dependencies: any[]; selection: any | null; take_count: number };
-export type Provider = { llm: string; image: string; h3: string; h3_message: string };
+export type Provider = { llm: string; image: string; h3: string; h3_message: string; runninghub_h3?: string };
 
 export async function request<T = any>(path: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(`${API}/api${path}`, {

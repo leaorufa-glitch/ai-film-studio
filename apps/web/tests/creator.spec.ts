@@ -157,3 +157,23 @@ test('independent Admin shows provider, failed job and media without a key', asy
   await expect(page.getByText('TEST ONLY', {exact:true}).first()).toBeVisible();
   await expect(page.locator('body')).not.toContainText(/sk-[A-Za-z0-9]{20,}/);
 });
+
+test('local H3 offline offers RunningHub explicitly and keeps continuation blocked', async ({page}) => {
+  await page.route('**/api/providers', async route => {
+    const response = await route.fetch();
+    const data = await response.json();
+    await route.fulfill({response, json:{...data, runninghub_h3:'可用',
+      h3_message:'本地 H3 未启动，可使用备用 RunningHub H3；也可以继续完成制作计划。'}});
+  });
+  await page.goto('/projects/station-film/04');
+  await expect(page.getByText('本地 H3 未启动，可使用备用 RunningHub H3', {exact:false}).first()).toBeVisible();
+  await page.getByRole('button', {name:/Clip A/}).click();
+  const selector = page.getByRole('combobox', {name:'本次视频服务'});
+  await expect(selector).toHaveValue('darl');
+  await selector.selectOption('runninghub');
+  await expect(selector).toHaveValue('runninghub');
+  await page.getByRole('button', {name:/Clip C2/}).click();
+  const continuation = page.locator('.clip-panel').filter({has:page.getByRole('button', {name:/Clip C2/})});
+  await expect(continuation.getByRole('option', {name:/RunningHub H3/})).toHaveAttribute('disabled', '');
+  await expect(continuation).toContainText('参考视频不等于同一长镜头续接');
+});
