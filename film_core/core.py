@@ -215,10 +215,18 @@ class Core:
                     m["clip_end"] != t.get("end") or bool(m["cut_before"]) != bool(t.get("cut_before"))
                     for m, t in zip(mapped, timeline)):
                 reasons.append({"code": "SHOT_TIMELINE_MISMATCH", "field": "shot_timeline"})
+            if mapped and (mapped[0]["clip_start"] != 0 or
+                           abs(mapped[-1]["clip_end"] - clip["payload"]["duration"]) > 0.001 or
+                           any(abs(left["clip_end"] - right["clip_start"]) > 0.001
+                               for left, right in zip(mapped, mapped[1:]))):
+                reasons.append({"code": "SHOT_TIMELINE_GAP_OR_OVERLAP", "field": "shot_timeline"})
             for m in mapped:
                 shot = self.get("shot", m["shot_id"])
                 if shot["status"] != "approved":
                     reasons.append({"code": "SHOT_NOT_APPROVED", "field": m["shot_id"]})
+                matching = next((t for t in timeline if t.get("shot_id") == m["shot_id"]), None)
+                if not matching or matching.get("description") != shot["payload"].get("description"):
+                    reasons.append({"code": "SHOT_INTENT_MISMATCH", "field": m["shot_id"]})
         except (DomainError, KeyError, TypeError):
             reasons.append({"code": "UNRESOLVED_SOURCE", "field": "scene_id/clip_id"})
         if p.get("handoff") not in self.HANDOFFS:
