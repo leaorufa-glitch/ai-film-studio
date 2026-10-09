@@ -65,6 +65,30 @@ class CreatorApiTests(unittest.TestCase):
         self.assertEqual(core.get('shot', 'S01', 1)['payload']['description'], '中近景，林夏坐着展开旧信')
         core.close()
 
+    def test_incomplete_legacy_shot_requires_new_confirmation(self):
+        self.fixture()
+        shots = self.client.get('/api/projects/station-film/shots').json()
+        legacy = next(shot for shot in shots if shot['id'] == 'S01')
+        self.assertEqual(legacy['confirmation_status'], 'needs_reconfirmation')
+        self.assertIn('表演', legacy['missing_director_fields'])
+        rejected = self.client.patch('/api/projects/station-film/shots/S01', json={
+            'payload': {'director_approved': True}, 'expected_version': legacy['version'], 'status': 'approved'})
+        self.assertEqual(rejected.status_code, 400)
+        self.assertIn('表演', rejected.json()['detail'])
+        self.assertEqual(self.client.get('/api/projects/station-film/shots').json()[0]['version'], legacy['version'])
+        confirmed = self.client.patch('/api/projects/station-film/shots/S01', json={
+            'payload': {'purpose': '让观众看见她认出字迹', 'action': '展开信纸后停顿',
+                        'performance': '呼吸放慢，眼神抬起', 'camera': '中近景固定机位',
+                        'sound': '雨声和信纸声', 'director_approved': True},
+            'expected_version': legacy['version'], 'status': 'approved'})
+        self.assertEqual(confirmed.status_code, 200)
+        current = self.client.get('/api/projects/station-film/shots').json()[0]
+        self.assertEqual(current['confirmation_status'], 'approved')
+        self.assertEqual(current['missing_director_fields'], [])
+        core = self.core()
+        self.assertEqual(core.get('shot', 'S01', legacy['version'])['payload']['description'], legacy['payload']['description'])
+        core.close()
+
     def test_shot_clip_mapping_revisions_and_brief_versions(self):
         self.fixture()
         clip = next(x for x in self.client.get('/api/projects/station-film/clips').json() if x['id'] == 'A')
@@ -146,6 +170,7 @@ class CreatorApiTests(unittest.TestCase):
         added = self.client.post('/api/projects/station-film/timeline/items', json={
             'clip_id': 'A', 'take_id': 'take-test', 'trim_in': 0, 'volume': 1})
         self.assertEqual(added.status_code, 200)
+        self.assertIn('TEST ONLY', '；'.join(self.client.get('/api/projects/station-film/timeline/export-readiness').json()['reasons']))
         iid = added.json()['id']
         self.assertEqual(self.client.patch(f'/api/projects/station-film/timeline/items/{iid}', json={'trim_in': 1}).status_code, 200)
         core = self.core()
@@ -155,11 +180,14 @@ class CreatorApiTests(unittest.TestCase):
                                            json={'take_id': 'take-test-second'}).status_code, 400)
         self.client.post('/api/projects/station-film/clips/A/selection',
                          json={'take_id': 'take-test-second', 'actor': 'tester'})
+        self.assertIn('已变化', '；'.join(self.client.get('/api/projects/station-film/timeline/export-readiness').json()['reasons']))
         replacement = self.client.patch(f'/api/projects/station-film/timeline/items/{iid}',
                                         json={'take_id': 'take-test-second'})
         self.assertEqual(replacement.status_code, 200)
         self.assertEqual(replacement.json()['take_id'], 'take-test-second')
         self.assertEqual(len(self.client.get('/api/projects/station-film/timeline').json()['items']), 1)
+        media_file.unlink()
+        self.assertIn('视频文件已缺失', '；'.join(self.client.get('/api/projects/station-film/timeline/export-readiness').json()['reasons']))
         core = self.core()
         self.assertEqual(core.take('take-test')['media_uri'], str(media_file))
         core.close()

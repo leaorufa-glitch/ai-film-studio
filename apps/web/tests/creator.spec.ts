@@ -33,6 +33,14 @@ test('project → script → scene → world → shot → clip → approved Brie
   await page.getByRole('textbox', {name:'镜头目的'}).fill('决定离开');
   await page.getByRole('button', {name:'添加镜头'}).click();
   await expect(page.getByText('镜头已加入计划')).toBeVisible();
+  await expect(page.getByText(/还需要补充.*表演.*摄影.*后才能确认/)).toBeVisible();
+  await expect(page.getByRole('button', {name:'确认镜头'})).toBeDisabled();
+  await page.getByRole('button', {name:'修改'}).click();
+  await page.locator('.shot-edit').getByRole('textbox', {name:'动作过程'}).fill('她拿起信，读完后望向海面');
+  await page.locator('.shot-edit').getByRole('textbox', {name:'表演'}).fill('呼吸放慢，目光坚定');
+  await page.locator('.shot-edit').getByRole('textbox', {name:'摄影'}).fill('中近景，缓慢推进');
+  await page.locator('.shot-edit').getByRole('textbox', {name:'声音'}).fill('海浪声和信纸声');
+  await page.getByRole('button', {name:'保存修改'}).click();
   await page.getByRole('button', {name:'确认镜头'}).click();
   await page.getByRole('link', {name:'04 影片制作'}).click();
   await expect(page.getByText('H3 视频服务器当前未启动。')).toBeVisible();
@@ -59,7 +67,7 @@ test('project → script → scene → world → shot → clip → approved Brie
   await page.getByRole('textbox', {name:'声音'}).fill('海浪声与信纸声');
   await page.getByRole('textbox', {name:'计划结束状态'}).fill('阿宁决定离开，信仍在手中');
   await page.getByRole('button', {name:'保存新版本'}).click();
-  await expect(page.getByText('READY', {exact:true})).toBeVisible();
+  await expect(page.getByText('方案已准备', {exact:true}).first()).toBeVisible();
   await expect(page.getByRole('button', {name:'生成一条'})).toBeDisabled();
 });
 
@@ -68,7 +76,11 @@ test('station plan shows the real Brief without invented storyboard or media', a
   await expect(page.getByText('H3 视频服务器当前未启动。')).toBeVisible();
   await page.getByRole('button', {name:/Clip A/}).click();
   await expect(page.getByRole('heading', {name:'最终制作方案'})).toBeVisible();
-  await expect(page.getByText('S01 0–3s')).toBeVisible();
+  await expect(page.getByText('镜头 1 0–3s', {exact:false})).toBeVisible();
+  await expect(page.locator('.brief-readable')).not.toContainText('linxia');
+  await expect(page.locator('.brief-readable')).not.toContainText('scene_initial');
+  await expect(page.locator('.brief-readable')).not.toContainText('{');
+  await expect(page.locator('.clip-status-grid').first()).toContainText('模型服务未启动');
   await page.getByRole('link', {name:'05 审片'}).click();
   await expect(page.getByText('测试结果或媒体不可播放')).toBeVisible();
   await expect(page.locator('video')).toHaveCount(0);
@@ -79,6 +91,8 @@ test('TEST ONLY Take needs human selection and actual-state confirmation before 
   await expect(page.getByText('TEST ONLY')).toBeVisible();
   await page.getByRole('button', {name:'采用这条'}).click();
   await expect(page.getByText('已采用此 Take')).toBeVisible();
+  await expect(page.locator('.state-diff')).toContainText('林夏');
+  await expect(page.locator('.state-diff')).not.toContainText('未在最终制作方案中填写');
   await page.getByRole('textbox', {name:'这条片段实际怎样结束？'}).fill('左手拿信，望向站台。');
   await page.getByRole('button', {name:'记录观察'}).click();
   await expect(page.getByText('实际结尾与计划不同，接受这个实际结果并让下一片段据此继续？')).toBeVisible();
@@ -89,5 +103,16 @@ test('TEST ONLY Take needs human selection and actual-state confirmation before 
   await page.getByRole('button', {name:/加入/}).first().click();
   await expect(page.getByText('影片序列')).toBeVisible();
   await expect(page.locator('.timeline-block')).toHaveCount(1);
-  await expect(page.getByRole('button', {name:'导出预览'})).toBeEnabled();
+  await expect(page.getByRole('button', {name:'导出预览'})).toBeDisabled();
+  await expect(page.getByText(/TEST ONLY，不能导出正式预览/)).toBeVisible();
+});
+
+test('structured scene origin and 1024px workspace labels remain clear', async ({page}) => {
+  await page.setViewportSize({width:1024,height:900});
+  await page.goto('/projects/station-film/01');
+  await expect(page.getByText('此项目由结构化场次创建，没有保留原始剧本文本。', {exact:false})).toBeVisible();
+  await expect(page.getByRole('link', {name:'01 剧本'})).toBeVisible();
+  await expect(page.getByRole('link', {name:'03 场次与分镜'})).toBeVisible();
+  await expect(page.getByRole('link', {name:'04 影片制作'})).toBeVisible();
+  await expect(page.locator('.sidebar-project-title')).toContainText('雨夜车站');
 });

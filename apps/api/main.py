@@ -203,6 +203,25 @@ def create_app(db_path: str | Path | None = None, media_root: str | Path | None 
         merged = {**old['payload'], **body.payload}
         return core.put(kind, object_id, merged, body.source, body.status)
 
+    shot_fields = {'purpose': '镜头目的', 'description': '观众看到什么', 'action': '动作过程',
+                   'performance': '表演', 'camera': '摄影', 'sound': '声音', 'duration': '时长'}
+
+    def missing_shot_fields(payload):
+        missing = [label for key, label in shot_fields.items() if key != 'duration' and
+                   (not isinstance(payload.get(key), str) or not payload[key].strip())]
+        try:
+            if float(payload.get('duration', 0)) <= 0:
+                missing.append('时长')
+        except (TypeError, ValueError):
+            missing.append('时长')
+        return missing
+
+    def shot_read(shot):
+        missing = missing_shot_fields(shot['payload'])
+        return {**shot, 'missing_director_fields': missing,
+                'confirmation_status': 'needs_reconfirmation' if (shot['status'] == 'approved' or shot['payload'].get('director_approved')) and missing
+                else shot['status']}
+
     @app.get('/api/health')
     def health():
         return {'ok': True, 'database': str(path), 'provider': provider_status()}
@@ -416,9 +435,9 @@ def create_app(db_path: str | Path | None = None, media_root: str | Path | None 
     @app.get('/api/projects/{pid}/shots')
     def shots(pid: str, scene_id: str | None = None):
         def op(c):
-            return sorted([s for s in latest(c, 'shot') if (not scene_id or s['payload'].get('scene_id') == scene_id)
+            return [shot_read(s) for s in sorted([s for s in latest(c, 'shot') if (not scene_id or s['payload'].get('scene_id') == scene_id)
                            and any(sc['id'] == s['payload'].get('scene_id') for sc in scenes_for(c, pid))],
-                          key=lambda s: (s['payload'].get('ordinal', 0), s['created_at']))
+                          key=lambda s: (s['payload'].get('ordinal', 0), c.get('shot', s['id'], 1)['created_at']))]
         return execute(op)
 
     @app.post('/api/projects/{pid}/shots')
@@ -437,6 +456,10 @@ def create_app(db_path: str | Path | None = None, media_root: str | Path | None 
             shot = belong(c, 'shot', sid, pid)
             if shot['status'] == 'archived':
                 raise DomainError('archived shot cannot be edited')
+            if body.status == 'approved':
+                missing = missing_shot_fields({**shot['payload'], **body.payload})
+                if missing:
+                    raise DomainError('确认镜头前还需要补充：' + '、'.join(missing))
             item = update(c, 'shot', sid, body)
             mark_impact(c, pid, 'shot', sid, shot['payload']['scene_id'], '镜头已修改；相关 Clip 和最终制作方案需重新准备。', 'Must Replan / Rebuild')
             return item
@@ -842,6 +865,36 @@ def create_app(db_path: str | Path | None = None, media_root: str | Path | None 
         def op(c):
             return {'items': [dict(r) for r in c.db.execute('SELECT * FROM timeline_items WHERE project_id=? ORDER BY position', (pid,))],
                     'subtitles': [dict(r) for r in c.db.execute('SELECT * FROM timeline_subtitles WHERE project_id=? ORDER BY start', (pid,))]}
+        return execute(op)
+
+    @app.get('/api/projects/{pid}/timeline/export-readiness')
+    def timeline_export_readiness(pid: str):
+        def op(c):
+            c.get('project', pid)
+            rows = c.db.execute('SELECT * FROM timeline_items WHERE project_id=? ORDER BY position', (pid,)).fetchall()
+            reasons = []
+            if not rows:
+                reasons.append('时间线为空，请先加入已采用的真实片段。')
+            for index, row in enumerate(rows, 1):
+                try:
+                    take = c.take(row['take_id'])
+                    selection = c.selection(row['clip_id'])
+                    if not selection or selection['take_id'] != row['take_id']:
+                        reasons.append(f'第 {index} 段采用的 Take 已变化，请更新片段。')
+                    if take['test_only']:
+                        reasons.append(f'第 {index} 段是 TEST ONLY，不能导出正式预览。')
+                    if not take['media_id']:
+                        reasons.append(f'第 {index} 段缺少受管理的视频媒体。')
+                    else:
+                        try:
+                            media = c.media(take['media_id'])
+                            if not Path(media['local_path']).is_file():
+                                reasons.append(f'第 {index} 段的视频文件已缺失。')
+                        except DomainError:
+                            reasons.append(f'第 {index} 段的视频媒体记录已缺失。')
+                except DomainError:
+                    reasons.append(f'第 {index} 段的 Take 已缺失。')
+            return {'ready': not reasons, 'reasons': reasons}
         return execute(op)
 
     @app.post('/api/projects/{pid}/timeline/items')
